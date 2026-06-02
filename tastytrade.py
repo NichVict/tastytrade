@@ -208,7 +208,7 @@ win_rate = wins / total_trades if total_trades > 0 else 0
 avg_win  = closed[closed['PnL ($)'] > 0]['PnL ($)'].mean() if wins > 0 else 0
 avg_loss = closed[closed['PnL ($)'] < 0]['PnL ($)'].mean() if losses > 0 else 0
 
-profit_factor = avg_win / avg_loss if gross_loss > 0 else 0
+profit_factor = avg_win / abs(avg_loss) if avg_loss != 0 else 0
 
 st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} operações fechadas  |  data: {fdate}")
 st.markdown("---")

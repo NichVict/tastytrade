@@ -242,10 +242,13 @@ df=df_f; trades_df=tdf_f; daily_closed=dc_f; sym_pnl=sym_pnl_f
 closed = trades_df[trades_df['Status']=='Fechado'].copy()
 opened = trades_df[trades_df['Status']=='Aberto'].copy()
 
-net_pnl      = df['net'].sum()
-gross_profit = df[df['net']>0]['net'].sum()
-gross_loss   = abs(df[df['net']<0]['net'].sum())
-profit_factor= gross_profit/gross_loss if gross_loss>0 else 0
+# ── KPIs — baseados no PnL dos trades fechados no período ─────────────────────
+net_pnl       = closed['PnL ($)'].sum()       if not closed.empty else 0.0
+gross_profit  = closed[closed['PnL ($)']>0]['PnL ($)'].sum() if not closed.empty else 0.0
+gross_loss    = abs(closed[closed['PnL ($)']<0]['PnL ($)'].sum()) if not closed.empty else 0.0
+profit_factor = gross_profit/gross_loss if gross_loss>0 else 0
+
+
 total_trades = len(closed)
 wins   = int((closed['PnL ($)']>0).sum()) if not closed.empty else 0
 losses = int((closed['PnL ($)']<0).sum()) if not closed.empty else 0

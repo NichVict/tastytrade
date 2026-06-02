@@ -222,7 +222,7 @@ wc = "green" if win_rate >= 0.5 else "red"
 
 c1,c2,c3,c4 = st.columns(4)
 with c1: st.markdown(kpi("Net P&L",      f"${net_pnl:,.2f}",      nc),      unsafe_allow_html=True)
-with c2: st.markdown(kpi("Credit, f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
+with c2: st.markdown(kpi("Credit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
 with c3: st.markdown(kpi("Debit",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
 with c4: st.markdown(kpi("Profit Factor",f"{profit_factor:.2f}x", "yellow"), unsafe_allow_html=True)
 

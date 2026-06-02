@@ -110,14 +110,13 @@ def process_csv(df, fdate):
     daily_cash = df.groupby('date')['net'].sum().reset_index()
     daily_cash.columns = ['Date', 'Daily PnL']
     daily_cash['Cumulative PnL'] = daily_cash['Daily PnL'].cumsum()
-
     sym_pnl = df.groupby('Symbol')['net'].sum().sort_values()
 
     records = []
     for order_id, grp in df.groupby('order_base'):
         total_net = grp['net'].sum()
         sym = grp['Symbol'].iloc[0]; d = grp['date'].iloc[0]
-        min_dt = grp['datetime'].min()  # ordenação cronológica real
+        min_dt = grp['datetime'].min()
         all_desc = '\n'.join(grp['Description'].tolist())
         has_bto='BTO' in all_desc; has_sto='STO' in all_desc
         has_stc='STC' in all_desc; has_btc='BTC' in all_desc
@@ -129,18 +128,13 @@ def process_csv(df, fdate):
                         'is_open': is_open, 'is_close': is_close, 'strikes': strikes})
 
     records_df = pd.DataFrame(records).sort_values('datetime').reset_index(drop=True)
-
-    open_pool = []
-    trades = []
+    open_pool = []; trades = []
 
     for _, row in records_df.iterrows():
         if row['is_open']:
-            open_pool.append({
-                'sym': row['sym'], 'date': row['date'], 'net': row['net'],
-                'all_strikes': set(row['strikes']),
-                'pending_strikes': set(row['strikes']),
-                'closed_net': 0.0, 'last_close_date': None
-            })
+            open_pool.append({'sym': row['sym'], 'date': row['date'], 'net': row['net'],
+                'all_strikes': set(row['strikes']), 'pending_strikes': set(row['strikes']),
+                'closed_net': 0.0, 'last_close_date': None})
         elif row['is_close']:
             sym = row['sym']; close_strikes = row['strikes']
             best_idx = None; best_overlap = -1
@@ -154,8 +148,7 @@ def process_csv(df, fdate):
 
             if best_idx is not None and best_overlap > 0:
                 op = open_pool[best_idx]
-                op['closed_net'] += row['net']
-                op['last_close_date'] = row['date']
+                op['closed_net'] += row['net']; op['last_close_date'] = row['date']
                 op['pending_strikes'] -= close_strikes
                 if not op['pending_strikes']:
                     pnl = round(op['net'] + op['closed_net'], 2)
@@ -167,8 +160,7 @@ def process_csv(df, fdate):
                     open_pool.pop(best_idx)
             elif best_idx is not None:
                 op = open_pool[best_idx]
-                op['closed_net'] += row['net']
-                op['last_close_date'] = row['date']
+                op['closed_net'] += row['net']; op['last_close_date'] = row['date']
                 pnl = round(op['net'] + op['closed_net'], 2)
                 pct = round((pnl / abs(op['net'])) * 100, 1) if op['net'] != 0 else 0
                 trades.append({'Symbol': op['sym'], 'Open Date': str(op['date']),
@@ -179,8 +171,7 @@ def process_csv(df, fdate):
             else:
                 trades.append({'Symbol': sym, 'Open Date': '(anterior)',
                     'Close Date': str(row['date']), 'Open Cost': None,
-                    'Close Credit': row['net'], 'PnL ($)': None,
-                    'PnL (%)': None, 'Result': '—'})
+                    'Close Credit': row['net'], 'PnL ($)': None, 'PnL (%)': None, 'Result': '—'})
 
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
         columns=['Symbol','Open Date','Close Date','Open Cost','Close Credit','PnL ($)','PnL (%)','Result'])
@@ -209,7 +200,6 @@ with col_title:
 
 st.markdown("---")
 st.markdown('<div class="section-title">📂 Importar CSV</div>', unsafe_allow_html=True)
-
 uploaded = st.file_uploader("Arraste o CSV do tastytrade aqui ou clique para selecionar", type=['csv'])
 
 if uploaded is None:
@@ -229,12 +219,68 @@ except Exception as e:
     st.error(f"Erro ao processar o CSV: {e}")
     st.stop()
 
+# ── Filtro de período ─────────────────────────────────────────────────────────
+all_dates = sorted(df['date'].dropna().unique())
+min_date  = all_dates[0]
+max_date  = all_dates[-1]
+
+st.markdown('<div class="section-title">📅 Filtro de Período</div>', unsafe_allow_html=True)
+col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+with col_f1:
+    date_start = st.date_input("De", value=min_date, min_value=min_date, max_value=max_date, key="date_start")
+with col_f2:
+    date_end = st.date_input("Até", value=max_date, min_value=min_date, max_value=max_date, key="date_end")
+with col_f3:
+    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
+    with col_btn1:
+        if st.button("Hoje"):
+            date_start = max_date; date_end = max_date
+    with col_btn2:
+        if st.button("Esta semana"):
+            import datetime
+            date_end = max_date
+            date_start = max_date - datetime.timedelta(days=max_date.weekday())
+    with col_btn3:
+        if st.button("Este mês"):
+            date_start = max_date.replace(day=1); date_end = max_date
+    with col_btn4:
+        if st.button("Tudo"):
+            date_start = min_date; date_end = max_date
+
+if date_start > date_end:
+    st.warning("⚠️ Data inicial maior que data final — usando período completo.")
+    date_start = min_date; date_end = max_date
+
+df_f = df[(df['date'] >= date_start) & (df['date'] <= date_end)].copy()
+
+if not trades_df.empty:
+    trades_df_f = trades_df.copy()
+    trades_df_f['_cd'] = pd.to_datetime(trades_df_f['Close Date'], errors='coerce').dt.date
+    trades_df_f = trades_df_f[(trades_df_f['_cd'] >= date_start) & (trades_df_f['_cd'] <= date_end)].drop(columns=['_cd'])
+else:
+    trades_df_f = trades_df.copy()
+
+if not daily_closed.empty:
+    dc_f = daily_closed.copy()
+    dc_f['_d'] = pd.to_datetime(dc_f['Date'], errors='coerce').dt.date
+    dc_f = dc_f[(dc_f['_d'] >= date_start) & (dc_f['_d'] <= date_end)].drop(columns=['_d'])
+    dc_f['Cumulative PnL'] = dc_f['Daily PnL'].cumsum()
+else:
+    dc_f = daily_closed.copy()
+
+sym_pnl_f = df_f.groupby('Symbol')['net'].sum().sort_values()
+sym_pnl_f = sym_pnl_f[sym_pnl_f != 0]
+
+st.markdown("---")
+df = df_f; trades_df = trades_df_f; daily_closed = dc_f; sym_pnl = sym_pnl_f
+
 closed = trades_df[trades_df['PnL ($)'].notna()].copy() if not trades_df.empty else pd.DataFrame()
 
 net_pnl       = df['net'].sum()
 gross_profit  = df[df['net'] > 0]['net'].sum()
 gross_loss    = abs(df[df['net'] < 0]['net'].sum())
-
+profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
 total_trades  = len(closed)
 wins   = int((closed['PnL ($)'] > 0).sum()) if not closed.empty else 0
 losses = int((closed['PnL ($)'] < 0).sum()) if not closed.empty else 0
@@ -242,10 +288,8 @@ win_rate = wins / total_trades if total_trades > 0 else 0
 avg_win  = closed[closed['PnL ($)'] > 0]['PnL ($)'].mean() if wins > 0 else 0
 avg_loss = closed[closed['PnL ($)'] < 0]['PnL ($)'].mean() if losses > 0 else 0
 
-profit_factor = avg_win / abs(avg_loss) if avg_loss != 0 else 0
-
-st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} operações fechadas  |  data: {fdate}")
-st.markdown("---")
+period_label = f"{date_start.strftime('%d/%m/%Y')} → {date_end.strftime('%d/%m/%Y')}"
+st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} operações fechadas  |  📅 {period_label}")
 
 def kpi(label, value, color):
     return f'<div class="kpi-card {color}"><div class="kpi-label">{label}</div><div class="kpi-value {color}">{value}</div></div>'
@@ -256,8 +300,8 @@ wc = "green" if win_rate >= 0.5 else "red"
 
 c1,c2,c3,c4 = st.columns(4)
 with c1: st.markdown(kpi("Net P&L",      f"${net_pnl:,.2f}",      nc),      unsafe_allow_html=True)
-with c2: st.markdown(kpi("Credit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
-with c3: st.markdown(kpi("Debit",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
+with c2: st.markdown(kpi("Gross Profit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
+with c3: st.markdown(kpi("Gross Loss",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
 with c4: st.markdown(kpi("Profit Factor",f"{profit_factor:.2f}x", "yellow"), unsafe_allow_html=True)
 
 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
@@ -298,15 +342,18 @@ if not daily_closed.empty:
 col_bar,col_pie = st.columns([3,2])
 with col_bar:
     st.markdown('<div class="section-title">🏆 P&L por Símbolo</div>',unsafe_allow_html=True)
-    colors_bar=['#ff3d57' if v<0 else '#00d4aa' for v in sym_pnl.values]
-    fig2=go.Figure(go.Bar(x=sym_pnl.values,y=sym_pnl.index,orientation='h',
-        marker_color=colors_bar,hovertemplate='<b>%{y}</b>: $%{x:,.2f}<extra></extra>'))
-    fig2.update_layout(paper_bgcolor='#161b22',plot_bgcolor='#161b22',
-        font=dict(family='Inter',color='#8b949e'),height=300,
-        margin=dict(l=10,r=10,t=10,b=10),showlegend=False,
-        xaxis=dict(showgrid=True,gridcolor='#21262d',tickformat='$,.0f',tickfont=dict(size=11),zeroline=True,zerolinecolor='#30363d'),
-        yaxis=dict(showgrid=False,tickfont=dict(size=12,color='#e6edf3')))
-    st.plotly_chart(fig2,use_container_width=True)
+    if not sym_pnl.empty:
+        colors_bar=['#ff3d57' if v<0 else '#00d4aa' for v in sym_pnl.values]
+        fig2=go.Figure(go.Bar(x=sym_pnl.values,y=sym_pnl.index,orientation='h',
+            marker_color=colors_bar,hovertemplate='<b>%{y}</b>: $%{x:,.2f}<extra></extra>'))
+        fig2.update_layout(paper_bgcolor='#161b22',plot_bgcolor='#161b22',
+            font=dict(family='Inter',color='#8b949e'),height=300,
+            margin=dict(l=10,r=10,t=10,b=10),showlegend=False,
+            xaxis=dict(showgrid=True,gridcolor='#21262d',tickformat='$,.0f',tickfont=dict(size=11),zeroline=True,zerolinecolor='#30363d'),
+            yaxis=dict(showgrid=False,tickfont=dict(size=12,color='#e6edf3')))
+        st.plotly_chart(fig2,use_container_width=True)
+    else:
+        st.info("Sem dados no período selecionado.")
 
 with col_pie:
     st.markdown('<div class="section-title">⚖️ Win / Loss</div>',unsafe_allow_html=True)
@@ -325,7 +372,7 @@ with col_pie:
                 font=dict(size=26,color='#e6edf3',family='Inter'),showarrow=False)])
         st.plotly_chart(fig3,use_container_width=True)
     else:
-        st.info("Sem trades fechados neste período.")
+        st.info("Sem trades fechados no período.")
 
 st.markdown('<div class="section-title">📅 P&L Diário — Operações Fechadas</div>',unsafe_allow_html=True)
 if not daily_closed.empty:
@@ -377,7 +424,7 @@ with tab1:
                 <div class="trade-cell {pnl_c}" style="font-weight:700">{res}</div>
             </div>""",unsafe_allow_html=True)
     else:
-        st.info("Nenhuma operação fechada neste arquivo.")
+        st.info("Nenhuma operação fechada no período selecionado.")
 
 with tab2:
     st.markdown('<div class="section-title">Posições Abertas</div>',unsafe_allow_html=True)

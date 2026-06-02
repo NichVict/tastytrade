@@ -31,7 +31,7 @@ div[data-testid="stFileUploader"]:hover { border-color:#00d4aa; }
 .trade-row { display:flex; gap:12px; padding:10px 16px; border-radius:8px; margin-bottom:6px; font-family:'JetBrains Mono',monospace; font-size:12px; align-items:center; }
 .trade-row.win  { background:#0d2318; border-left:3px solid #00d4aa; }
 .trade-row.loss { background:#1f0d12; border-left:3px solid #ff3d57; }
-.trade-row.none { background:#161b22; border-left:3px solid #8b949e; }
+.trade-row.open { background:#1a1a0d; border-left:3px solid #ffd600; }
 .trade-cell { min-width:100px; }
 .trade-cell.sym { font-weight:700; font-size:13px; min-width:60px; }
 .trade-cell.win  { color:#00d4aa; font-weight:700; }
@@ -53,6 +53,10 @@ def parse_price(p):
 def get_qty(desc):
     nums = re.findall(r'(?:^|[\n\s])-?(\d+)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', str(desc))
     return max((int(n) for n in nums), default=1)
+
+def get_expiry(desc):
+    m = re.search(r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+)', str(desc))
+    return m.group(1) if m else 'Unknown'
 
 def detect_file_date(filename):
     m = re.search(r'(\d{2})(\d{2})(\d{2})', str(filename))
@@ -93,8 +97,12 @@ def get_action(desc):
     if 'BTC' in desc: return 'Buy to Close'
     return ''
 
-def get_strikes_set(desc):
-    return set(re.findall(r'([\d.]+)\s+(?:Call|Put)', str(desc)))
+def is_close_action(desc):
+    desc = str(desc)
+    if 'STC' in desc and 'BTC' in desc: return True
+    if 'STC' in desc and 'BTO' not in desc: return True
+    if 'BTC' in desc and 'STO' not in desc and 'STC' not in desc: return True
+    return False
 
 def process_csv(df, fdate):
     df = df.copy()
@@ -104,89 +112,59 @@ def process_csv(df, fdate):
     df['datetime'] = df['Time'].apply(lambda t: parse_date(t, fdate))
     df['date']     = df['datetime'].dt.date
     df['action']   = df['Description'].apply(get_action)
+    df['expiry']   = df['Description'].apply(get_expiry)
+    df['is_close'] = df['Description'].apply(is_close_action)
     df = df.sort_values('datetime').reset_index(drop=True)
-    df['order_base'] = df['Order #'].apply(lambda x: str(x).split('-')[0])
 
     daily_cash = df.groupby('date')['net'].sum().reset_index()
     daily_cash.columns = ['Date', 'Daily PnL']
     daily_cash['Cumulative PnL'] = daily_cash['Daily PnL'].cumsum()
+
     sym_pnl = df.groupby('Symbol')['net'].sum().sort_values()
 
-    records = []
-    for order_id, grp in df.groupby('order_base'):
-        total_net = grp['net'].sum()
-        sym = grp['Symbol'].iloc[0]; d = grp['date'].iloc[0]
-        min_dt = grp['datetime'].min()
-        all_desc = '\n'.join(grp['Description'].tolist())
-        has_bto='BTO' in all_desc; has_sto='STO' in all_desc
-        has_stc='STC' in all_desc; has_btc='BTC' in all_desc
-        is_open  = (has_bto or has_sto) and not (has_stc or has_btc)
-        is_close = (has_stc or has_btc) and not (has_bto or has_sto)
-        strikes = get_strikes_set(all_desc)
-        records.append({'order_id': order_id, 'sym': sym, 'date': d,
-                        'datetime': min_dt, 'net': total_net,
-                        'is_open': is_open, 'is_close': is_close, 'strikes': strikes})
+    # ── Trade log: agrupar por SÍMBOLO + EXPIRAÇÃO ───────────────────────────
+    trades = []
+    for (sym, exp), grp in df.groupby(['Symbol', 'expiry']):
+        pnl          = grp['net'].sum()
+        opens_grp    = grp[~grp['is_close']]
+        closes_grp   = grp[grp['is_close']]
+        open_cost    = opens_grp['net'].sum()
+        close_credit = closes_grp['net'].sum()
+        open_date    = grp['date'].min()
+        close_date   = closes_grp['date'].max() if not closes_grp.empty else None
+        has_close    = not closes_grp.empty
+        has_open     = not opens_grp.empty
+        pct = round((pnl / abs(open_cost)) * 100, 1) if open_cost != 0 else 0
 
-    records_df = pd.DataFrame(records).sort_values('datetime').reset_index(drop=True)
-    open_pool = []; trades = []
+        if has_open and has_close:   status = 'Fechado'
+        elif has_open:               status = 'Aberto'
+        else:                        status = 'Parcial'
 
-    for _, row in records_df.iterrows():
-        if row['is_open']:
-            open_pool.append({'sym': row['sym'], 'date': row['date'], 'net': row['net'],
-                'all_strikes': set(row['strikes']), 'pending_strikes': set(row['strikes']),
-                'closed_net': 0.0, 'last_close_date': None})
-        elif row['is_close']:
-            sym = row['sym']; close_strikes = row['strikes']
-            best_idx = None; best_overlap = -1
-            for i, op in enumerate(open_pool):
-                if op['sym'] != sym: continue
-                if close_strikes and op['pending_strikes']:
-                    overlap = len(close_strikes & op['pending_strikes'])
-                    if overlap > best_overlap: best_overlap = overlap; best_idx = i
-                elif not close_strikes and best_idx is None:
-                    best_idx = i; best_overlap = 0
+        trades.append({
+            'Symbol':       sym,
+            'Expiry':       exp,
+            'Open Date':    str(open_date),
+            'Close Date':   str(close_date) if close_date else '—',
+            'Open Cost':    open_cost,
+            'Close Credit': close_credit,
+            'PnL ($)':      round(pnl, 2),
+            'PnL (%)':      pct,
+            'Result':       'Win' if pnl > 0 else ('Loss' if pnl < 0 else 'BE'),
+            'Status':       status
+        })
 
-            if best_idx is not None and best_overlap > 0:
-                op = open_pool[best_idx]
-                op['closed_net'] += row['net']; op['last_close_date'] = row['date']
-                op['pending_strikes'] -= close_strikes
-                if not op['pending_strikes']:
-                    pnl = round(op['net'] + op['closed_net'], 2)
-                    pct = round((pnl / abs(op['net'])) * 100, 1) if op['net'] != 0 else 0
-                    trades.append({'Symbol': op['sym'], 'Open Date': str(op['date']),
-                        'Close Date': str(op['last_close_date']), 'Open Cost': op['net'],
-                        'Close Credit': op['closed_net'], 'PnL ($)': pnl, 'PnL (%)': pct,
-                        'Result': 'Win' if pnl > 0 else 'Loss'})
-                    open_pool.pop(best_idx)
-            elif best_idx is not None:
-                op = open_pool[best_idx]
-                op['closed_net'] += row['net']; op['last_close_date'] = row['date']
-                pnl = round(op['net'] + op['closed_net'], 2)
-                pct = round((pnl / abs(op['net'])) * 100, 1) if op['net'] != 0 else 0
-                trades.append({'Symbol': op['sym'], 'Open Date': str(op['date']),
-                    'Close Date': str(op['last_close_date']), 'Open Cost': op['net'],
-                    'Close Credit': op['closed_net'], 'PnL ($)': pnl, 'PnL (%)': pct,
-                    'Result': 'Win' if pnl > 0 else 'Loss'})
-                open_pool.pop(best_idx)
-            else:
-                trades.append({'Symbol': sym, 'Open Date': '(anterior)',
-                    'Close Date': str(row['date']), 'Open Cost': None,
-                    'Close Credit': row['net'], 'PnL ($)': None, 'PnL (%)': None, 'Result': '—'})
+    trades_df = pd.DataFrame(trades).sort_values('Close Date').reset_index(drop=True)
 
-    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
-        columns=['Symbol','Open Date','Close Date','Open Cost','Close Credit','PnL ($)','PnL (%)','Result'])
-
-    closed_tmp = [t for t in trades if t.get('PnL ($)') is not None]
-    if closed_tmp:
-        ct = pd.DataFrame(closed_tmp)
-        ct['Close Date'] = pd.to_datetime(ct['Close Date'], errors='coerce')
-        daily_closed = ct.groupby('Close Date')['PnL ($)'].sum().reset_index()
+    closed_tmp = trades_df[trades_df['Status'] == 'Fechado'].copy()
+    if not closed_tmp.empty:
+        closed_tmp['Close Date'] = pd.to_datetime(closed_tmp['Close Date'], errors='coerce')
+        daily_closed = closed_tmp.groupby('Close Date')['PnL ($)'].sum().reset_index()
         daily_closed.columns = ['Date', 'Daily PnL']
         daily_closed['Cumulative PnL'] = daily_closed['Daily PnL'].cumsum()
     else:
         daily_closed = daily_cash.copy()
 
-    open_positions = {op['sym']: op for op in open_pool}
+    open_positions = trades_df[trades_df['Status'] == 'Aberto']
     return df, trades_df, daily_closed, sym_pnl, open_positions
 
 
@@ -219,104 +197,90 @@ except Exception as e:
     st.error(f"Erro ao processar o CSV: {e}")
     st.stop()
 
-# ── Filtro de período ─────────────────────────────────────────────────────────
 all_dates = sorted(df['date'].dropna().unique())
-min_date  = all_dates[0]
-max_date  = all_dates[-1]
+min_date = all_dates[0]; max_date = all_dates[-1]
 
 st.markdown('<div class="section-title">📅 Filtro de Período</div>', unsafe_allow_html=True)
-col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+col_f1,col_f2,col_f3 = st.columns([2,2,3])
 with col_f1:
-    date_start = st.date_input("De", value=min_date, min_value=min_date, max_value=max_date, key="date_start")
+    date_start = st.date_input("De", value=min_date, min_value=min_date, max_value=max_date, key="ds")
 with col_f2:
-    date_end = st.date_input("Até", value=max_date, min_value=min_date, max_value=max_date, key="date_end")
+    date_end = st.date_input("Até", value=max_date, min_value=min_date, max_value=max_date, key="de")
 with col_f3:
     st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
-    with col_btn1:
-        if st.button("Hoje"):
-            date_start = max_date; date_end = max_date
-    with col_btn2:
-        if st.button("Esta semana"):
-            import datetime
-            date_end = max_date
-            date_start = max_date - datetime.timedelta(days=max_date.weekday())
-    with col_btn3:
-        if st.button("Este mês"):
-            date_start = max_date.replace(day=1); date_end = max_date
-    with col_btn4:
-        if st.button("Tudo"):
-            date_start = min_date; date_end = max_date
+    b1,b2,b3,b4 = st.columns(4)
+    with b1:
+        if st.button("Hoje"):   date_start=max_date; date_end=max_date
+    with b2:
+        if st.button("Semana"):
+            import datetime; date_end=max_date
+            date_start=max_date-datetime.timedelta(days=max_date.weekday())
+    with b3:
+        if st.button("Mês"):    date_start=max_date.replace(day=1); date_end=max_date
+    with b4:
+        if st.button("Tudo"):   date_start=min_date; date_end=max_date
 
 if date_start > date_end:
-    st.warning("⚠️ Data inicial maior que data final — usando período completo.")
-    date_start = min_date; date_end = max_date
+    date_start=min_date; date_end=max_date
 
-df_f = df[(df['date'] >= date_start) & (df['date'] <= date_end)].copy()
-
-if not trades_df.empty:
-    trades_df_f = trades_df.copy()
-    trades_df_f['_cd'] = pd.to_datetime(trades_df_f['Close Date'], errors='coerce').dt.date
-    trades_df_f = trades_df_f[(trades_df_f['_cd'] >= date_start) & (trades_df_f['_cd'] <= date_end)].drop(columns=['_cd'])
-else:
-    trades_df_f = trades_df.copy()
-
+df_f = df[(df['date']>=date_start)&(df['date']<=date_end)].copy()
+tdf_f = trades_df.copy()
+tdf_f['_cd'] = pd.to_datetime(tdf_f['Close Date'],errors='coerce').dt.date
+tdf_f = tdf_f[(tdf_f['_cd']>=date_start)&(tdf_f['_cd']<=date_end)].drop(columns=['_cd'])
 if not daily_closed.empty:
     dc_f = daily_closed.copy()
-    dc_f['_d'] = pd.to_datetime(dc_f['Date'], errors='coerce').dt.date
-    dc_f = dc_f[(dc_f['_d'] >= date_start) & (dc_f['_d'] <= date_end)].drop(columns=['_d'])
+    dc_f['_d'] = pd.to_datetime(dc_f['Date'],errors='coerce').dt.date
+    dc_f = dc_f[(dc_f['_d']>=date_start)&(dc_f['_d']<=date_end)].drop(columns=['_d'])
     dc_f['Cumulative PnL'] = dc_f['Daily PnL'].cumsum()
 else:
     dc_f = daily_closed.copy()
-
 sym_pnl_f = df_f.groupby('Symbol')['net'].sum().sort_values()
-sym_pnl_f = sym_pnl_f[sym_pnl_f != 0]
+sym_pnl_f = sym_pnl_f[sym_pnl_f!=0]
 
 st.markdown("---")
-df = df_f; trades_df = trades_df_f; daily_closed = dc_f; sym_pnl = sym_pnl_f
+df=df_f; trades_df=tdf_f; daily_closed=dc_f; sym_pnl=sym_pnl_f
+closed = trades_df[trades_df['Status']=='Fechado'].copy()
+opened = trades_df[trades_df['Status']=='Aberto'].copy()
 
-closed = trades_df[trades_df['PnL ($)'].notna()].copy() if not trades_df.empty else pd.DataFrame()
-
-net_pnl       = df['net'].sum()
-gross_profit  = df[df['net'] > 0]['net'].sum()
-gross_loss    = abs(df[df['net'] < 0]['net'].sum())
-profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
-total_trades  = len(closed)
-wins   = int((closed['PnL ($)'] > 0).sum()) if not closed.empty else 0
-losses = int((closed['PnL ($)'] < 0).sum()) if not closed.empty else 0
-win_rate = wins / total_trades if total_trades > 0 else 0
-avg_win  = closed[closed['PnL ($)'] > 0]['PnL ($)'].mean() if wins > 0 else 0
-avg_loss = closed[closed['PnL ($)'] < 0]['PnL ($)'].mean() if losses > 0 else 0
+net_pnl      = df['net'].sum()
+gross_profit = df[df['net']>0]['net'].sum()
+gross_loss   = abs(df[df['net']<0]['net'].sum())
+profit_factor= gross_profit/gross_loss if gross_loss>0 else 0
+total_trades = len(closed)
+wins   = int((closed['PnL ($)']>0).sum()) if not closed.empty else 0
+losses = int((closed['PnL ($)']<0).sum()) if not closed.empty else 0
+win_rate= wins/total_trades if total_trades>0 else 0
+avg_win = closed[closed['PnL ($)']>0]['PnL ($)'].mean() if wins>0 else 0
+avg_loss= closed[closed['PnL ($)']<0]['PnL ($)'].mean() if losses>0 else 0
 
 period_label = f"{date_start.strftime('%d/%m/%Y')} → {date_end.strftime('%d/%m/%Y')}"
-st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} operações fechadas  |  📅 {period_label}")
+st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} trades fechados  |  {len(opened)} abertos  |  📅 {period_label}")
 
 def kpi(label, value, color):
     return f'<div class="kpi-card {color}"><div class="kpi-label">{label}</div><div class="kpi-value {color}">{value}</div></div>'
 
 st.markdown('<div class="section-title">📊 Performance</div>', unsafe_allow_html=True)
-nc = "green" if net_pnl >= 0 else "red"
-wc = "green" if win_rate >= 0.5 else "red"
+nc="green" if net_pnl>=0 else "red"
+wc="green" if win_rate>=0.5 else "red"
 
-c1,c2,c3,c4 = st.columns(4)
+c1,c2,c3,c4=st.columns(4)
 with c1: st.markdown(kpi("Net P&L",      f"${net_pnl:,.2f}",      nc),      unsafe_allow_html=True)
 with c2: st.markdown(kpi("Gross Profit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
 with c3: st.markdown(kpi("Gross Loss",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
 with c4: st.markdown(kpi("Profit Factor",f"{profit_factor:.2f}x", "yellow"), unsafe_allow_html=True)
-
 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-c5,c6,c7,c8 = st.columns(4)
-with c5: st.markdown(kpi("Total Trades", str(total_trades),      "blue"),  unsafe_allow_html=True)
-with c6: st.markdown(kpi("Win Rate",     f"{win_rate*100:.1f}%", wc),      unsafe_allow_html=True)
-with c7: st.markdown(kpi("Avg Win",      f"${avg_win:,.2f}",     "green"), unsafe_allow_html=True)
-with c8: st.markdown(kpi("Avg Loss",     f"${avg_loss:,.2f}",    "red"),   unsafe_allow_html=True)
+c5,c6,c7,c8=st.columns(4)
+with c5: st.markdown(kpi("Total Trades",str(total_trades),      "blue"),  unsafe_allow_html=True)
+with c6: st.markdown(kpi("Win Rate",    f"{win_rate*100:.1f}%", wc),      unsafe_allow_html=True)
+with c7: st.markdown(kpi("Avg Win",     f"${avg_win:,.2f}",     "green"), unsafe_allow_html=True)
+with c8: st.markdown(kpi("Avg Loss",    f"${avg_loss:,.2f}",    "red"),   unsafe_allow_html=True)
 st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 
-st.markdown('<div class="section-title">📈 Cumulative P&L — Operações Fechadas</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">📈 Cumulative P&L — Trades Fechados</div>', unsafe_allow_html=True)
 if not daily_closed.empty:
-    fig = go.Figure()
-    dates_str = daily_closed['Date'].astype(str).tolist()
-    cum_vals  = daily_closed['Cumulative PnL'].tolist()
+    fig=go.Figure()
+    dates_str=daily_closed['Date'].astype(str).tolist()
+    cum_vals=daily_closed['Cumulative PnL'].tolist()
     for i in range(len(cum_vals)-1):
         x0,x1=dates_str[i],dates_str[i+1]; y0,y1=cum_vals[i],cum_vals[i+1]
         color='#00d4aa' if (y0>=0 and y1>=0) else '#ff3d57' if (y0<0 and y1<0) else '#ffd600'
@@ -339,7 +303,7 @@ if not daily_closed.empty:
         hoverlabel=dict(bgcolor='#21262d',font_size=13,bordercolor='#30363d'))
     st.plotly_chart(fig,use_container_width=True)
 
-col_bar,col_pie = st.columns([3,2])
+col_bar,col_pie=st.columns([3,2])
 with col_bar:
     st.markdown('<div class="section-title">🏆 P&L por Símbolo</div>',unsafe_allow_html=True)
     if not sym_pnl.empty:
@@ -353,7 +317,7 @@ with col_bar:
             yaxis=dict(showgrid=False,tickfont=dict(size=12,color='#e6edf3')))
         st.plotly_chart(fig2,use_container_width=True)
     else:
-        st.info("Sem dados no período selecionado.")
+        st.info("Sem dados no período.")
 
 with col_pie:
     st.markdown('<div class="section-title">⚖️ Win / Loss</div>',unsafe_allow_html=True)
@@ -374,7 +338,7 @@ with col_pie:
     else:
         st.info("Sem trades fechados no período.")
 
-st.markdown('<div class="section-title">📅 P&L Diário — Operações Fechadas</div>',unsafe_allow_html=True)
+st.markdown('<div class="section-title">📅 P&L Diário — Trades Fechados</div>',unsafe_allow_html=True)
 if not daily_closed.empty:
     colors_d=['#00d4aa' if v>=0 else '#ff3d57' for v in daily_closed['Daily PnL']]
     fig4=go.Figure(go.Bar(x=daily_closed['Date'].astype(str),y=daily_closed['Daily PnL'],
@@ -386,21 +350,22 @@ if not daily_closed.empty:
         yaxis=dict(showgrid=True,gridcolor='#21262d',tickformat='$,.0f',tickfont=dict(size=11),zeroline=True,zerolinecolor='#30363d'))
     st.plotly_chart(fig4,use_container_width=True)
 
-tab1,tab2,tab3 = st.tabs(["📋 Trade Log","📂 Posições Abertas","🗂 Transações Raw"])
+tab1,tab2,tab3=st.tabs(["📋 Trade Log","📂 Posições Abertas","🗂 Transações Raw"])
 
 with tab1:
-    st.markdown('<div class="section-title">Operações Fechadas</div>',unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Trades Fechados</div>',unsafe_allow_html=True)
     if not closed.empty:
         st.markdown("""
         <div class="trade-header">
-            <div style="min-width:60px">Symbol</div>
-            <div style="min-width:110px">Open Date</div>
-            <div style="min-width:110px">Close Date</div>
+            <div style="min-width:55px">Symbol</div>
+            <div style="min-width:70px">Expiry</div>
+            <div style="min-width:100px">Open Date</div>
+            <div style="min-width:100px">Close Date</div>
             <div style="min-width:110px">Open Cost</div>
-            <div style="min-width:120px">Close Credit</div>
-            <div style="min-width:110px">PnL ($)</div>
-            <div style="min-width:80px">PnL (%)</div>
-            <div style="min-width:60px">Result</div>
+            <div style="min-width:110px">Close Credit</div>
+            <div style="min-width:100px">PnL ($)</div>
+            <div style="min-width:75px">PnL (%)</div>
+            <div style="min-width:55px">Result</div>
         </div>""",unsafe_allow_html=True)
         for _,row in closed.iterrows():
             pnl=row['PnL ($)']; pct=row['PnL (%)']; res=row['Result']
@@ -415,6 +380,7 @@ with tab1:
             st.markdown(f"""
             <div class="trade-row {css}">
                 <div class="trade-cell sym" style="color:{sym_color}">{row['Symbol']}</div>
+                <div class="trade-cell muted">{row['Expiry']}</div>
                 <div class="trade-cell muted">{row['Open Date']}</div>
                 <div class="trade-cell muted">{row['Close Date']}</div>
                 <div class="trade-cell muted">{oc}</div>
@@ -424,21 +390,22 @@ with tab1:
                 <div class="trade-cell {pnl_c}" style="font-weight:700">{res}</div>
             </div>""",unsafe_allow_html=True)
     else:
-        st.info("Nenhuma operação fechada no período selecionado.")
+        st.info("Nenhum trade fechado no período.")
 
 with tab2:
     st.markdown('<div class="section-title">Posições Abertas</div>',unsafe_allow_html=True)
-    if open_positions:
-        for sym,op in open_positions.items():
-            net_v=op['net']; color='#ff3d57' if net_v<0 else '#00d4aa'
+    if not opened.empty:
+        for _,op in opened.iterrows():
+            net_v=op['Open Cost']; color='#ff3d57' if net_v<0 else '#00d4aa'
             net_s=f"+${net_v:,.2f}" if net_v>=0 else f"-${abs(net_v):,.2f}"
             st.markdown(f"""<div class="open-pos-card">
-                <span style="color:#ffd600;font-weight:600;">{sym}</span>
+                <span style="color:#ffd600;font-weight:600;">{op['Symbol']}</span>
+                &nbsp;|&nbsp; <span style="color:#8b949e;">{op['Expiry']}</span>
                 &nbsp;|&nbsp; Net: <span style="color:{color};">{net_s}</span>
-                &nbsp;|&nbsp; <span style="color:#8b949e;">{op.get('date','')}</span>
+                &nbsp;|&nbsp; <span style="color:#8b949e;">desde {op['Open Date']}</span>
             </div>""",unsafe_allow_html=True)
     else:
-        st.success("✅ Nenhuma posição aberta neste arquivo.")
+        st.success("✅ Nenhuma posição aberta.")
 
 with tab3:
     st.markdown('<div class="section-title">Todas as Transações</div>',unsafe_allow_html=True)

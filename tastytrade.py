@@ -190,13 +190,14 @@ closed = trades_df[trades_df['PnL'].notna()].copy() if not trades_df.empty else 
 net_pnl      = df['net'].sum()
 gross_profit = df[df['net'] > 0]['net'].sum()
 gross_loss   = abs(df[df['net'] < 0]['net'].sum())
-profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+
 total_trades = len(closed) if not closed.empty else 0
 wins   = int((closed['PnL'] > 0).sum()) if not closed.empty else 0
 losses = int((closed['PnL'] < 0).sum()) if not closed.empty else 0
 win_rate = wins / total_trades if total_trades > 0 else 0
 avg_win  = closed[closed['PnL'] > 0]['PnL'].mean() if wins > 0 else 0
 avg_loss = closed[closed['PnL'] < 0]['PnL'].mean() if losses > 0 else 0
+profit_factor = avg_win / avg_loss if gross_loss > 0 else 0
 
 st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {len(df['Symbol'].unique())} símbolos  |  data: {fdate}")
 st.markdown("---")

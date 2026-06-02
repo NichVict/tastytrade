@@ -246,7 +246,7 @@ opened = trades_df[trades_df['Status']=='Aberto'].copy()
 net_pnl       = closed['PnL ($)'].sum()       if not closed.empty else 0.0
 gross_profit  = closed[closed['PnL ($)']>0]['PnL ($)'].sum() if not closed.empty else 0.0
 gross_loss    = abs(closed[closed['PnL ($)']<0]['PnL ($)'].sum()) if not closed.empty else 0.0
-profit_factor = gross_profit/gross_loss if gross_loss>0 else 0
+
 
 
 total_trades = len(closed)
@@ -255,6 +255,7 @@ losses = int((closed['PnL ($)']<0).sum()) if not closed.empty else 0
 win_rate= wins/total_trades if total_trades>0 else 0
 avg_win = closed[closed['PnL ($)']>0]['PnL ($)'].mean() if wins>0 else 0
 avg_loss= closed[closed['PnL ($)']<0]['PnL ($)'].mean() if losses>0 else 0
+profit_factor = avg_win / abs(avg_loss) if avg_loss != 0 else 0
 
 period_label = f"{date_start.strftime('%d/%m/%Y')} → {date_end.strftime('%d/%m/%Y')}"
 st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} trades fechados  |  {len(opened)} abertos  |  📅 {period_label}")
@@ -268,8 +269,8 @@ wc="green" if win_rate>=0.5 else "red"
 
 c1,c2,c3,c4=st.columns(4)
 with c1: st.markdown(kpi("Net P&L",      f"${net_pnl:,.2f}",      nc),      unsafe_allow_html=True)
-with c2: st.markdown(kpi("Gross Profit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
-with c3: st.markdown(kpi("Gross Loss",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
+with c2: st.markdown(kpi("Credit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
+with c3: st.markdown(kpi("Debit",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
 with c4: st.markdown(kpi("Profit Factor",f"{profit_factor:.2f}x", "yellow"), unsafe_allow_html=True)
 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 c5,c6,c7,c8=st.columns(4)

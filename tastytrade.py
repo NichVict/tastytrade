@@ -200,13 +200,15 @@ closed = trades_df[trades_df['PnL ($)'].notna()].copy() if not trades_df.empty e
 net_pnl      = df['net'].sum()
 gross_profit = df[df['net'] > 0]['net'].sum()
 gross_loss   = abs(df[df['net'] < 0]['net'].sum())
-profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+
 total_trades = len(closed)
 wins   = int((closed['PnL ($)'] > 0).sum()) if not closed.empty else 0
 losses = int((closed['PnL ($)'] < 0).sum()) if not closed.empty else 0
 win_rate = wins / total_trades if total_trades > 0 else 0
 avg_win  = closed[closed['PnL ($)'] > 0]['PnL ($)'].mean() if wins > 0 else 0
 avg_loss = closed[closed['PnL ($)'] < 0]['PnL ($)'].mean() if losses > 0 else 0
+
+profit_factor = avg_win / avg_loss if gross_loss > 0 else 0
 
 st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} operações fechadas  |  data: {fdate}")
 st.markdown("---")
@@ -220,8 +222,8 @@ wc = "green" if win_rate >= 0.5 else "red"
 
 c1,c2,c3,c4 = st.columns(4)
 with c1: st.markdown(kpi("Net P&L",      f"${net_pnl:,.2f}",      nc),      unsafe_allow_html=True)
-with c2: st.markdown(kpi("Gross Profit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
-with c3: st.markdown(kpi("Gross Loss",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
+with c2: st.markdown(kpi("Credit, f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
+with c3: st.markdown(kpi("Debit",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
 with c4: st.markdown(kpi("Profit Factor",f"{profit_factor:.2f}x", "yellow"), unsafe_allow_html=True)
 
 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)

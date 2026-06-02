@@ -45,11 +45,8 @@ footer{visibility:hidden;} #MainMenu{visibility:hidden;} header{visibility:hidde
 
 
 def parse_price(p):
-    p = str(p).strip()
-    m = re.search(r'([\d.]+)\s*(db|cr)', p.lower())
-    if m:
-        val = float(m.group(1))
-        return val if m.group(2) == 'cr' else -val
+    m = re.search(r'([\d.]+)\s*(db|cr)', str(p).lower())
+    if m: return float(m.group(1)) * (1 if m.group(2)=='cr' else -1)
     try: return float(p)
     except: return 0.0
 
@@ -59,32 +56,30 @@ def get_qty(desc):
 
 def detect_file_date(filename):
     m = re.search(r'(\d{2})(\d{2})(\d{2})', str(filename))
-    if m:
-        return f'20{m.group(1)}-{m.group(2)}-{m.group(3)}'
+    if m: return f'20{m.group(1)}-{m.group(2)}-{m.group(3)}'
     return str(date.today())
 
 def parse_date(t, fdate):
-    t = str(t).strip()
-    yr = fdate[:4]
+    t = str(t).strip(); yr = fdate[:4]
     m = re.match(r'(\d+)/(\d+),?\s*([\d:]+)([ap])?', t)
     if m:
-        mo, dy, tp, ap_c = m.group(1), m.group(2), m.group(3), m.group(4)
-        if tp.count(':') == 1: tp += ':00'
+        mo,dy,tp,ap_c = m.group(1),m.group(2),m.group(3),m.group(4)
+        if tp.count(':')==1: tp+=':00'
         if ap_c:
-            ap = 'PM' if ap_c == 'p' else 'AM'
-            try: return pd.to_datetime(f'{yr}/{mo}/{dy} {tp} {ap}', format='%Y/%m/%d %H:%M:%S %p', errors='coerce')
+            ap='PM' if ap_c=='p' else 'AM'
+            try: return pd.to_datetime(f'{yr}/{mo}/{dy} {tp} {ap}',format='%Y/%m/%d %H:%M:%S %p',errors='coerce')
             except: pass
-        try: return pd.to_datetime(f'{yr}/{mo}/{dy} {tp}', format='%Y/%m/%d %H:%M:%S', errors='coerce')
+        try: return pd.to_datetime(f'{yr}/{mo}/{dy} {tp}',format='%Y/%m/%d %H:%M:%S',errors='coerce')
         except: pass
     m2 = re.match(r'([\d:]+)([ap])?$', t)
     if m2:
-        tp, ap_c = m2.group(1), m2.group(2)
-        if tp.count(':') == 1: tp += ':00'
+        tp,ap_c = m2.group(1),m2.group(2)
+        if tp.count(':')==1: tp+=':00'
         if ap_c:
-            ap = 'PM' if ap_c == 'p' else 'AM'
-            try: return pd.to_datetime(f'{fdate} {tp} {ap}', format='%Y-%m-%d %H:%M:%S %p', errors='coerce')
+            ap='PM' if ap_c=='p' else 'AM'
+            try: return pd.to_datetime(f'{fdate} {tp} {ap}',format='%Y-%m-%d %H:%M:%S %p',errors='coerce')
             except: pass
-        try: return pd.to_datetime(f'{fdate} {tp}', format='%Y-%m-%d %H:%M:%S', errors='coerce')
+        try: return pd.to_datetime(f'{fdate} {tp}',format='%Y-%m-%d %H:%M:%S',errors='coerce')
         except: pass
     return pd.NaT
 
@@ -98,6 +93,9 @@ def get_action(desc):
     if 'BTC' in desc: return 'Buy to Close'
     return ''
 
+def get_strikes_set(desc):
+    return set(re.findall(r'([\d.]+)\s+(?:Call|Put)', str(desc)))
+
 def process_csv(df, fdate):
     df = df.copy()
     df['net_pts']  = df['MarketOrFill'].apply(parse_price)
@@ -107,46 +105,82 @@ def process_csv(df, fdate):
     df['date']     = df['datetime'].dt.date
     df['action']   = df['Description'].apply(get_action)
     df = df.sort_values('datetime').reset_index(drop=True)
+    df['order_base'] = df['Order #'].apply(lambda x: str(x).split('-')[0])
 
-    daily = df.groupby('date')['net'].sum().reset_index()
-    daily.columns = ['Date', 'Daily PnL']
-    daily['Cumulative PnL'] = daily['Daily PnL'].cumsum()
+    daily_cash = df.groupby('date')['net'].sum().reset_index()
+    daily_cash.columns = ['Date', 'Daily PnL']
+    daily_cash['Cumulative PnL'] = daily_cash['Daily PnL'].cumsum()
 
     sym_pnl = df.groupby('Symbol')['net'].sum().sort_values()
 
-    df['order_base'] = df['Order #'].apply(lambda x: str(x).split('-')[0])
-    trades = []
-    open_stack = {}
-
+    records = []
     for order_id, grp in df.groupby('order_base'):
         total_net = grp['net'].sum()
-        sym = grp['Symbol'].iloc[0]
-        d   = grp['date'].iloc[0]
-        all_desc = ' '.join(grp['Description'].tolist())
-        has_open  = 'BTO' in all_desc or 'STO' in all_desc
-        has_close = 'STC' in all_desc or 'BTC' in all_desc
+        sym = grp['Symbol'].iloc[0]; d = grp['date'].iloc[0]
+        min_dt = grp['datetime'].min()  # ordenação cronológica real
+        all_desc = '\n'.join(grp['Description'].tolist())
+        has_bto='BTO' in all_desc; has_sto='STO' in all_desc
+        has_stc='STC' in all_desc; has_btc='BTC' in all_desc
+        is_open  = (has_bto or has_sto) and not (has_stc or has_btc)
+        is_close = (has_stc or has_btc) and not (has_bto or has_sto)
+        strikes = get_strikes_set(all_desc)
+        records.append({'order_id': order_id, 'sym': sym, 'date': d,
+                        'datetime': min_dt, 'net': total_net,
+                        'is_open': is_open, 'is_close': is_close, 'strikes': strikes})
 
-        if has_open and not has_close:
-            open_stack.setdefault(sym, []).append({'net': total_net, 'date': d})
-        elif has_close and not has_open:
-            if sym in open_stack and open_stack[sym]:
-                opener = open_stack[sym].pop(0)
-                pnl = round(opener['net'] + total_net, 2)
-                pct = round((pnl / abs(opener['net'])) * 100, 1) if opener['net'] != 0 else 0
-                trades.append({
-                    'Symbol': sym, 'Open Date': str(opener['date']),
-                    'Close Date': str(d), 'Open Cost': opener['net'],
-                    'Close Credit': total_net, 'PnL ($)': pnl,
-                    'PnL (%)': pct, 'Result': 'Win' if pnl > 0 else ('Loss' if pnl < 0 else 'BE')
-                })
+    records_df = pd.DataFrame(records).sort_values('datetime').reset_index(drop=True)
+
+    open_pool = []
+    trades = []
+
+    for _, row in records_df.iterrows():
+        if row['is_open']:
+            open_pool.append({
+                'sym': row['sym'], 'date': row['date'], 'net': row['net'],
+                'all_strikes': set(row['strikes']),
+                'pending_strikes': set(row['strikes']),
+                'closed_net': 0.0, 'last_close_date': None
+            })
+        elif row['is_close']:
+            sym = row['sym']; close_strikes = row['strikes']
+            best_idx = None; best_overlap = -1
+            for i, op in enumerate(open_pool):
+                if op['sym'] != sym: continue
+                if close_strikes and op['pending_strikes']:
+                    overlap = len(close_strikes & op['pending_strikes'])
+                    if overlap > best_overlap: best_overlap = overlap; best_idx = i
+                elif not close_strikes and best_idx is None:
+                    best_idx = i; best_overlap = 0
+
+            if best_idx is not None and best_overlap > 0:
+                op = open_pool[best_idx]
+                op['closed_net'] += row['net']
+                op['last_close_date'] = row['date']
+                op['pending_strikes'] -= close_strikes
+                if not op['pending_strikes']:
+                    pnl = round(op['net'] + op['closed_net'], 2)
+                    pct = round((pnl / abs(op['net'])) * 100, 1) if op['net'] != 0 else 0
+                    trades.append({'Symbol': op['sym'], 'Open Date': str(op['date']),
+                        'Close Date': str(op['last_close_date']), 'Open Cost': op['net'],
+                        'Close Credit': op['closed_net'], 'PnL ($)': pnl, 'PnL (%)': pct,
+                        'Result': 'Win' if pnl > 0 else 'Loss'})
+                    open_pool.pop(best_idx)
+            elif best_idx is not None:
+                op = open_pool[best_idx]
+                op['closed_net'] += row['net']
+                op['last_close_date'] = row['date']
+                pnl = round(op['net'] + op['closed_net'], 2)
+                pct = round((pnl / abs(op['net'])) * 100, 1) if op['net'] != 0 else 0
+                trades.append({'Symbol': op['sym'], 'Open Date': str(op['date']),
+                    'Close Date': str(op['last_close_date']), 'Open Cost': op['net'],
+                    'Close Credit': op['closed_net'], 'PnL ($)': pnl, 'PnL (%)': pct,
+                    'Result': 'Win' if pnl > 0 else 'Loss'})
+                open_pool.pop(best_idx)
             else:
-                trades.append({
-                    'Symbol': sym, 'Open Date': '(anterior)', 'Close Date': str(d),
-                    'Open Cost': None, 'Close Credit': total_net,
-                    'PnL ($)': None, 'PnL (%)': None, 'Result': '—'
-                })
-        elif has_open and has_close:
-            open_stack.setdefault(sym, []).append({'net': total_net, 'date': d})
+                trades.append({'Symbol': sym, 'Open Date': '(anterior)',
+                    'Close Date': str(row['date']), 'Open Cost': None,
+                    'Close Credit': row['net'], 'PnL ($)': None,
+                    'PnL (%)': None, 'Result': '—'})
 
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
         columns=['Symbol','Open Date','Close Date','Open Cost','Close Credit','PnL ($)','PnL (%)','Result'])
@@ -159,9 +193,9 @@ def process_csv(df, fdate):
         daily_closed.columns = ['Date', 'Daily PnL']
         daily_closed['Cumulative PnL'] = daily_closed['Daily PnL'].cumsum()
     else:
-        daily_closed = daily.copy()
+        daily_closed = daily_cash.copy()
 
-    open_positions = {sym: stack for sym, stack in open_stack.items() if stack}
+    open_positions = {op['sym']: op for op in open_pool}
     return df, trades_df, daily_closed, sym_pnl, open_positions
 
 
@@ -197,18 +231,16 @@ except Exception as e:
 
 closed = trades_df[trades_df['PnL ($)'].notna()].copy() if not trades_df.empty else pd.DataFrame()
 
-net_pnl      = df['net'].sum()
-gross_profit = df[df['net'] > 0]['net'].sum()
-gross_loss   = abs(df[df['net'] < 0]['net'].sum())
-
-total_trades = len(closed)
+net_pnl       = df['net'].sum()
+gross_profit  = df[df['net'] > 0]['net'].sum()
+gross_loss    = abs(df[df['net'] < 0]['net'].sum())
+profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+total_trades  = len(closed)
 wins   = int((closed['PnL ($)'] > 0).sum()) if not closed.empty else 0
 losses = int((closed['PnL ($)'] < 0).sum()) if not closed.empty else 0
 win_rate = wins / total_trades if total_trades > 0 else 0
 avg_win  = closed[closed['PnL ($)'] > 0]['PnL ($)'].mean() if wins > 0 else 0
 avg_loss = closed[closed['PnL ($)'] < 0]['PnL ($)'].mean() if losses > 0 else 0
-
-profit_factor = avg_win / abs(avg_loss) if avg_loss != 0 else 0
 
 st.success(f"✅  {uploaded.name}  —  {len(df)} transações  |  {total_trades} operações fechadas  |  data: {fdate}")
 st.markdown("---")
@@ -222,8 +254,8 @@ wc = "green" if win_rate >= 0.5 else "red"
 
 c1,c2,c3,c4 = st.columns(4)
 with c1: st.markdown(kpi("Net P&L",      f"${net_pnl:,.2f}",      nc),      unsafe_allow_html=True)
-with c2: st.markdown(kpi("Credit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
-with c3: st.markdown(kpi("Debit",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
+with c2: st.markdown(kpi("Gross Profit", f"${gross_profit:,.2f}", "green"),  unsafe_allow_html=True)
+with c3: st.markdown(kpi("Gross Loss",   f"-${gross_loss:,.2f}",  "red"),    unsafe_allow_html=True)
 with c4: st.markdown(kpi("Profit Factor",f"{profit_factor:.2f}x", "yellow"), unsafe_allow_html=True)
 
 st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
@@ -235,88 +267,80 @@ with c8: st.markdown(kpi("Avg Loss",     f"${avg_loss:,.2f}",    "red"),   unsaf
 st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 
 st.markdown('<div class="section-title">📈 Cumulative P&L — Operações Fechadas</div>', unsafe_allow_html=True)
-
 if not daily_closed.empty:
     fig = go.Figure()
     dates_str = daily_closed['Date'].astype(str).tolist()
     cum_vals  = daily_closed['Cumulative PnL'].tolist()
+    for i in range(len(cum_vals)-1):
+        x0,x1=dates_str[i],dates_str[i+1]; y0,y1=cum_vals[i],cum_vals[i+1]
+        color='#00d4aa' if (y0>=0 and y1>=0) else '#ff3d57' if (y0<0 and y1<0) else '#ffd600'
+        fig.add_trace(go.Scatter(x=[x0,x1],y=[y0,y1],mode='lines',
+            line=dict(color=color,width=2.5),showlegend=False,hoverinfo='skip'))
+    pt_colors=['#00d4aa' if v>=0 else '#ff3d57' for v in cum_vals]
+    fig.add_trace(go.Scatter(x=dates_str,y=cum_vals,mode='markers',
+        marker=dict(size=7,color=pt_colors,line=dict(color='#0d1117',width=2)),
+        hovertemplate='<b>%{x}</b><br>P&L: $%{y:,.2f}<extra></extra>',showlegend=False))
+    fig.add_trace(go.Scatter(x=dates_str,y=[max(v,0) for v in cum_vals],
+        fill='tozeroy',fillcolor='rgba(0,212,170,0.07)',line=dict(width=0),showlegend=False,hoverinfo='skip'))
+    fig.add_trace(go.Scatter(x=dates_str,y=[min(v,0) for v in cum_vals],
+        fill='tozeroy',fillcolor='rgba(255,61,87,0.07)',line=dict(width=0),showlegend=False,hoverinfo='skip'))
+    fig.add_hline(y=0,line_dash="dash",line_color="#30363d",line_width=1)
+    fig.update_layout(paper_bgcolor='#161b22',plot_bgcolor='#161b22',
+        font=dict(family='Inter',color='#8b949e'),height=320,
+        margin=dict(l=10,r=10,t=10,b=10),showlegend=False,
+        xaxis=dict(showgrid=False,tickfont=dict(size=11),tickangle=-30,zeroline=False),
+        yaxis=dict(showgrid=True,gridcolor='#21262d',tickformat='$,.0f',tickfont=dict(size=11),zeroline=False),
+        hoverlabel=dict(bgcolor='#21262d',font_size=13,bordercolor='#30363d'))
+    st.plotly_chart(fig,use_container_width=True)
 
-    for i in range(len(cum_vals) - 1):
-        x0, x1 = dates_str[i], dates_str[i+1]
-        y0, y1 = cum_vals[i], cum_vals[i+1]
-        color = '#00d4aa' if (y0 >= 0 and y1 >= 0) else '#ff3d57' if (y0 < 0 and y1 < 0) else '#ffd600'
-        fig.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1], mode='lines',
-            line=dict(color=color, width=2.5), showlegend=False, hoverinfo='skip'))
-
-    point_colors = ['#00d4aa' if v >= 0 else '#ff3d57' for v in cum_vals]
-    fig.add_trace(go.Scatter(x=dates_str, y=cum_vals, mode='markers',
-        marker=dict(size=7, color=point_colors, line=dict(color='#0d1117', width=2)),
-        hovertemplate='<b>%{x}</b><br>Cumulative P&L: $%{y:,.2f}<extra></extra>', showlegend=False))
-
-    fig.add_trace(go.Scatter(x=dates_str, y=[max(v, 0) for v in cum_vals],
-        fill='tozeroy', fillcolor='rgba(0,212,170,0.07)', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=dates_str, y=[min(v, 0) for v in cum_vals],
-        fill='tozeroy', fillcolor='rgba(255,61,87,0.07)', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-
-    fig.add_hline(y=0, line_dash="dash", line_color="#30363d", line_width=1)
-    fig.update_layout(
-        paper_bgcolor='#161b22', plot_bgcolor='#161b22',
-        font=dict(family='Inter', color='#8b949e'), height=320,
-        margin=dict(l=10,r=10,t=10,b=10), showlegend=False,
-        xaxis=dict(showgrid=False, tickfont=dict(size=11), tickangle=-30, zeroline=False),
-        yaxis=dict(showgrid=True, gridcolor='#21262d', tickformat='$,.0f', tickfont=dict(size=11), zeroline=False),
-        hoverlabel=dict(bgcolor='#21262d', font_size=13, bordercolor='#30363d'))
-    st.plotly_chart(fig, use_container_width=True)
-
-col_bar, col_pie = st.columns([3, 2])
-
+col_bar,col_pie = st.columns([3,2])
 with col_bar:
-    st.markdown('<div class="section-title">🏆 P&L por Símbolo</div>', unsafe_allow_html=True)
-    colors_bar = ['#ff3d57' if v < 0 else '#00d4aa' for v in sym_pnl.values]
-    fig2 = go.Figure(go.Bar(x=sym_pnl.values, y=sym_pnl.index, orientation='h',
-        marker_color=colors_bar, hovertemplate='<b>%{y}</b>: $%{x:,.2f}<extra></extra>'))
-    fig2.update_layout(paper_bgcolor='#161b22', plot_bgcolor='#161b22',
-        font=dict(family='Inter', color='#8b949e'), height=300,
-        margin=dict(l=10,r=10,t=10,b=10), showlegend=False,
-        xaxis=dict(showgrid=True, gridcolor='#21262d', tickformat='$,.0f', tickfont=dict(size=11), zeroline=True, zerolinecolor='#30363d'),
-        yaxis=dict(showgrid=False, tickfont=dict(size=12, color='#e6edf3')))
-    st.plotly_chart(fig2, use_container_width=True)
+    st.markdown('<div class="section-title">🏆 P&L por Símbolo</div>',unsafe_allow_html=True)
+    colors_bar=['#ff3d57' if v<0 else '#00d4aa' for v in sym_pnl.values]
+    fig2=go.Figure(go.Bar(x=sym_pnl.values,y=sym_pnl.index,orientation='h',
+        marker_color=colors_bar,hovertemplate='<b>%{y}</b>: $%{x:,.2f}<extra></extra>'))
+    fig2.update_layout(paper_bgcolor='#161b22',plot_bgcolor='#161b22',
+        font=dict(family='Inter',color='#8b949e'),height=300,
+        margin=dict(l=10,r=10,t=10,b=10),showlegend=False,
+        xaxis=dict(showgrid=True,gridcolor='#21262d',tickformat='$,.0f',tickfont=dict(size=11),zeroline=True,zerolinecolor='#30363d'),
+        yaxis=dict(showgrid=False,tickfont=dict(size=12,color='#e6edf3')))
+    st.plotly_chart(fig2,use_container_width=True)
 
 with col_pie:
-    st.markdown('<div class="section-title">⚖️ Win / Loss</div>', unsafe_allow_html=True)
-    if (wins + losses) > 0:
-        be_c = int((closed['PnL ($)'] == 0).sum()) if not closed.empty else 0
-        labels = ['Wins','Losses']; vals = [wins, losses]; cp = ['#00d4aa','#ff3d57']
-        if be_c > 0: labels.append('BE'); vals.append(be_c); cp.append('#ffd600')
-        fig3 = go.Figure(go.Pie(labels=labels, values=vals, hole=0.6,
-            marker=dict(colors=cp, line=dict(color='#161b22', width=3)),
-            textfont=dict(size=13), hovertemplate='<b>%{label}</b>: %{value} (%{percent})<extra></extra>'))
-        fig3.update_layout(paper_bgcolor='#161b22', plot_bgcolor='#161b22',
-            font=dict(family='Inter', color='#8b949e'), height=300,
-            margin=dict(l=10,r=10,t=10,b=10), showlegend=True,
-            legend=dict(font=dict(size=12, color='#e6edf3'), bgcolor='#161b22', bordercolor='#30363d'),
-            annotations=[dict(text=f'{win_rate*100:.0f}%', x=0.5, y=0.5,
-                font=dict(size=26, color='#e6edf3', family='Inter'), showarrow=False)])
-        st.plotly_chart(fig3, use_container_width=True)
+    st.markdown('<div class="section-title">⚖️ Win / Loss</div>',unsafe_allow_html=True)
+    if (wins+losses)>0:
+        be_c=int((closed['PnL ($)']==0).sum()) if not closed.empty else 0
+        labels=['Wins','Losses']; vals=[wins,losses]; cp=['#00d4aa','#ff3d57']
+        if be_c>0: labels.append('BE'); vals.append(be_c); cp.append('#ffd600')
+        fig3=go.Figure(go.Pie(labels=labels,values=vals,hole=0.6,
+            marker=dict(colors=cp,line=dict(color='#161b22',width=3)),
+            textfont=dict(size=13),hovertemplate='<b>%{label}</b>: %{value} (%{percent})<extra></extra>'))
+        fig3.update_layout(paper_bgcolor='#161b22',plot_bgcolor='#161b22',
+            font=dict(family='Inter',color='#8b949e'),height=300,
+            margin=dict(l=10,r=10,t=10,b=10),showlegend=True,
+            legend=dict(font=dict(size=12,color='#e6edf3'),bgcolor='#161b22',bordercolor='#30363d'),
+            annotations=[dict(text=f'{win_rate*100:.0f}%',x=0.5,y=0.5,
+                font=dict(size=26,color='#e6edf3',family='Inter'),showarrow=False)])
+        st.plotly_chart(fig3,use_container_width=True)
     else:
         st.info("Sem trades fechados neste período.")
 
-st.markdown('<div class="section-title">📅 P&L Diário — Operações Fechadas</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">📅 P&L Diário — Operações Fechadas</div>',unsafe_allow_html=True)
 if not daily_closed.empty:
-    colors_d = ['#00d4aa' if v >= 0 else '#ff3d57' for v in daily_closed['Daily PnL']]
-    fig4 = go.Figure(go.Bar(x=daily_closed['Date'].astype(str), y=daily_closed['Daily PnL'],
-        marker_color=colors_d, hovertemplate='<b>%{x}</b>: $%{y:,.2f}<extra></extra>'))
-    fig4.update_layout(paper_bgcolor='#161b22', plot_bgcolor='#161b22',
-        font=dict(family='Inter', color='#8b949e'), height=220,
-        margin=dict(l=10,r=10,t=10,b=10), showlegend=False,
-        xaxis=dict(showgrid=False, tickangle=-30, tickfont=dict(size=11)),
-        yaxis=dict(showgrid=True, gridcolor='#21262d', tickformat='$,.0f', tickfont=dict(size=11), zeroline=True, zerolinecolor='#30363d'))
-    st.plotly_chart(fig4, use_container_width=True)
+    colors_d=['#00d4aa' if v>=0 else '#ff3d57' for v in daily_closed['Daily PnL']]
+    fig4=go.Figure(go.Bar(x=daily_closed['Date'].astype(str),y=daily_closed['Daily PnL'],
+        marker_color=colors_d,hovertemplate='<b>%{x}</b>: $%{y:,.2f}<extra></extra>'))
+    fig4.update_layout(paper_bgcolor='#161b22',plot_bgcolor='#161b22',
+        font=dict(family='Inter',color='#8b949e'),height=220,
+        margin=dict(l=10,r=10,t=10,b=10),showlegend=False,
+        xaxis=dict(showgrid=False,tickangle=-30,tickfont=dict(size=11)),
+        yaxis=dict(showgrid=True,gridcolor='#21262d',tickformat='$,.0f',tickfont=dict(size=11),zeroline=True,zerolinecolor='#30363d'))
+    st.plotly_chart(fig4,use_container_width=True)
 
-tab1, tab2, tab3 = st.tabs(["📋 Trade Log", "📂 Posições Abertas", "🗂 Transações Raw"])
+tab1,tab2,tab3 = st.tabs(["📋 Trade Log","📂 Posições Abertas","🗂 Transações Raw"])
 
 with tab1:
-    st.markdown('<div class="section-title">Operações Fechadas</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Operações Fechadas</div>',unsafe_allow_html=True)
     if not closed.empty:
         st.markdown("""
         <div class="trade-header">
@@ -328,18 +352,17 @@ with tab1:
             <div style="min-width:110px">PnL ($)</div>
             <div style="min-width:80px">PnL (%)</div>
             <div style="min-width:60px">Result</div>
-        </div>""", unsafe_allow_html=True)
-
-        for _, row in closed.iterrows():
-            pnl = row['PnL ($)']; pct = row['PnL (%)']; res = row['Result']
-            css   = 'win' if res == 'Win' else 'loss' if res == 'Loss' else 'none'
-            pnl_c = 'win' if pnl > 0 else 'loss'
-            oc    = f"${row['Open Cost']:,.2f}" if pd.notna(row['Open Cost']) else '—'
-            cc    = f"${row['Close Credit']:,.2f}"
-            pnl_s = f"${pnl:,.2f}"
-            pct_s = f"{pct:+.1f}%" if pd.notna(pct) else '—'
-            sym_color = '#00d4aa' if css == 'win' else '#ff3d57' if css == 'loss' else '#e6edf3'
-
+        </div>""",unsafe_allow_html=True)
+        for _,row in closed.iterrows():
+            pnl=row['PnL ($)']; pct=row['PnL (%)']; res=row['Result']
+            css='win' if res=='Win' else 'loss' if res=='Loss' else 'none'
+            pnl_c='win' if pnl>0 else 'loss'
+            oc_val=row['Open Cost']
+            oc=f"+${oc_val:,.2f}" if pd.notna(oc_val) and oc_val>=0 else f"-${abs(oc_val):,.2f}" if pd.notna(oc_val) else '—'
+            cc_val=row['Close Credit']
+            cc=f"+${cc_val:,.2f}" if cc_val>=0 else f"-${abs(cc_val):,.2f}"
+            pnl_s=f"${pnl:,.2f}"; pct_s=f"{pct:+.1f}%" if pd.notna(pct) else '—'
+            sym_color='#00d4aa' if css=='win' else '#ff3d57' if css=='loss' else '#e6edf3'
             st.markdown(f"""
             <div class="trade-row {css}">
                 <div class="trade-cell sym" style="color:{sym_color}">{row['Symbol']}</div>
@@ -350,32 +373,32 @@ with tab1:
                 <div class="trade-cell {pnl_c}">{pnl_s}</div>
                 <div class="trade-cell {pnl_c}">{pct_s}</div>
                 <div class="trade-cell {pnl_c}" style="font-weight:700">{res}</div>
-            </div>""", unsafe_allow_html=True)
+            </div>""",unsafe_allow_html=True)
     else:
         st.info("Nenhuma operação fechada neste arquivo.")
 
 with tab2:
-    st.markdown('<div class="section-title">Posições Abertas</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Posições Abertas</div>',unsafe_allow_html=True)
     if open_positions:
-        for sym, stack in open_positions.items():
-            for pos in stack:
-                color = '#ff3d57' if pos['net'] < 0 else '#00d4aa'
-                st.markdown(f"""<div class="open-pos-card">
-                    <span style="color:#ffd600;font-weight:600;">{sym}</span>
-                    &nbsp;|&nbsp; Net: <span style="color:{color};">${pos['net']:,.2f}</span>
-                    &nbsp;|&nbsp; <span style="color:#8b949e;">{pos.get('date','')}</span>
-                </div>""", unsafe_allow_html=True)
+        for sym,op in open_positions.items():
+            net_v=op['net']; color='#ff3d57' if net_v<0 else '#00d4aa'
+            net_s=f"+${net_v:,.2f}" if net_v>=0 else f"-${abs(net_v):,.2f}"
+            st.markdown(f"""<div class="open-pos-card">
+                <span style="color:#ffd600;font-weight:600;">{sym}</span>
+                &nbsp;|&nbsp; Net: <span style="color:{color};">{net_s}</span>
+                &nbsp;|&nbsp; <span style="color:#8b949e;">{op.get('date','')}</span>
+            </div>""",unsafe_allow_html=True)
     else:
         st.success("✅ Nenhuma posição aberta neste arquivo.")
 
 with tab3:
-    st.markdown('<div class="section-title">Todas as Transações</div>', unsafe_allow_html=True)
-    disp_raw = df[['Symbol','datetime','action','net','qty','Status']].copy()
-    disp_raw.columns = ['Symbol','Data/Hora','Ação','Net ($)','Contratos','Status']
-    disp_raw['Net ($)'] = disp_raw['Net ($)'].map('${:,.2f}'.format)
-    st.dataframe(disp_raw, use_container_width=True, hide_index=True)
+    st.markdown('<div class="section-title">Todas as Transações</div>',unsafe_allow_html=True)
+    disp_raw=df[['Symbol','datetime','action','net','qty','Status']].copy()
+    disp_raw.columns=['Symbol','Data/Hora','Ação','Net ($)','Contratos','Status']
+    disp_raw['Net ($)']=disp_raw['Net ($)'].map('${:,.2f}'.format)
+    st.dataframe(disp_raw,use_container_width=True,hide_index=True)
 
 st.markdown("""
 <div style="text-align:center;color:#484f58;font-size:12px;padding:20px 0;">
     TASTY Dashboard · Powered by Streamlit · Net P&L = fluxo de caixa real (pontos × contratos × 100)
-</div>""", unsafe_allow_html=True)
+</div>""",unsafe_allow_html=True)

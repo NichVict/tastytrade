@@ -584,7 +584,7 @@ with tab1:
             cc = f"+${cc_val:,.2f}" if cc_val >= 0 else f"-${abs(cc_val):,.2f}"
             pnl_s = f"${pnl:,.2f}"; pct_s = f"{pct:+.1f}%" if pd.notna(pct) else '—'
             sym_color = '#00d4aa' if css == 'win' else '#ff3d57' if css == 'loss' else '#e6edf3'
-            strike_s  = f"{row['Strike']:.1f}" if pd.notna(row.get('Strike')) else '—'
+            strike_s  = str(row['Strike']) if pd.notna(row.get('Strike')) else '—'
             st.markdown(f"""
             <div class="trade-row {css}">
                 <div class="trade-cell sym" style="color:{sym_color}">{row['Symbol']}</div>
@@ -608,7 +608,7 @@ with tab2:
             net_v  = op['Open Cost']
             color  = '#ff3d57' if net_v < 0 else '#00d4aa'
             net_s  = f"+${net_v:,.2f}" if net_v >= 0 else f"-${abs(net_v):,.2f}"
-            strike_s = f"{op['Strike']:.1f}" if pd.notna(op.get('Strike')) else '—'
+            strike_s = str(op['Strike']) if pd.notna(op.get('Strike')) else '—'
             st.markdown(f"""<div class="open-pos-card">
                 <span style="color:#ffd600;font-weight:600;">{op['Symbol']}</span>
                 &nbsp;|&nbsp; <span style="color:#8b949e;">{op['Expiry']} · {strike_s}</span>

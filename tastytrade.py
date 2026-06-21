@@ -154,25 +154,21 @@ def expand_rows(df):
         legs = get_legs(row['Description'])
         if not legs:
             continue
-        net_pts  = parse_price(row['MarketOrFill'])  # cr=positivo, db=negativo
+        net_pts  = parse_price(row['Price'])  # Price = fill real executado
         net_dol  = net_pts * 100
 
-        is_open_order  = all(l['action'] in ('BTO', 'STO') for l in legs)
         is_close_order = all(l['action'] in ('STC', 'BTC') for l in legs)
-        is_mixed_open  = is_open_order and len(legs) > 1  # spread aberto numa ordem
 
         for i, leg in enumerate(legs):
             is_open  = leg['action'] in ('BTO', 'STO')
             is_close = leg['action'] in ('STC', 'BTC')
 
-            if is_mixed_open:
-                # Spread aberto numa ordem: net líquido só na leg BTO
-                net = net_dol if leg['action'] == 'BTO' else 0.0
-            elif is_close_order:
-                # Fechamento: net total só na primeira leg
+            if is_close_order:
+                # Fechamento multi-leg: net total só na primeira leg
+                # match_trades agrupa pelo Order # e usa o total
                 net = net_dol if i == 0 else 0.0
             else:
-                # Single-leg de qualquer tipo
+                # Abertura (BTO ou STO, single ou multi-leg): net real de cada leg
                 net = net_dol
 
             rows.append({
@@ -344,7 +340,7 @@ def process_csv(df, fdate):
     df = df.sort_values('datetime').reset_index(drop=True)
 
     # Net por linha (para gráfico de fluxo de caixa diário bruto)
-    df['net_pts'] = df['MarketOrFill'].apply(parse_price)
+    df['net_pts'] = df['Price'].apply(parse_price)
     df['net']     = df['net_pts'] * 100  # qty=1 por ordem (preço já é net do spread)
 
     # Expande em legs e faz o matching FIFO

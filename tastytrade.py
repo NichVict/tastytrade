@@ -172,68 +172,97 @@ def expand_rows(df):
 
 def match_trades(expanded_df):
     """
-    FIFO matcher por Symbol + Expiry + Strike.
-    - Aberturas (BTO/STO) entram na fila em ordem cronológica.
-    - Fechamentos (STC/BTC) consomem a fila e geram trades fechados.
-    - O net do fechamento é distribuído proporcionalmente à quantidade fechada.
-    - Ordens multi-leg: o net é registrado só na primeira leg; as demais
-      contribuem com qty=0 para o matching mas não duplicam o dinheiro.
-    """
-    trades = []
-    open_queue = {}          # (symbol, expiry, strike) -> [{'date','qty','net','order'}]
-    order_net_used = set()   # controla qual ordem já teve seu net alocado
+    Matching por Order # de fechamento.
 
+    Lógica:
+    1. Aberturas (BTO/STO) entram numa fila FIFO por (Symbol, Expiry, Strike).
+    2. Todas as legs de fechamento que pertencem ao mesmo Order # são agrupadas
+       numa única operação de fechamento — porque o tastytrade reporta um preço
+       net único para toda a ordem, independente de quantos strikes ela toca.
+    3. Para cada ordem de fechamento, somamos todos os open costs dos openers
+       que ela consome (de todos os strikes envolvidos) e geramos UM único trade
+       com o PnL líquido real: soma(open costs) + close net.
+    4. Posições não fechadas ficam como 'Aberto'.
+    """
+    # ── Passo 1: separar aberturas e fechamentos ──────────────────────────────
     df_sorted = expanded_df.sort_values('datetime').reset_index(drop=True)
+
+    # Fila de aberturas por (Symbol, Expiry, Strike)
+    open_queue = {}   # key -> [{'date', 'qty', 'net', 'order'}]
+
+    # Agrupa as legs de fechamento por Order # (para processar juntas)
+    # Formato: { order_id -> [rows de fechamento] }
+    close_orders = {}
+    close_order_meta = {}  # order_id -> {symbol, date, datetime, net}
 
     for _, row in df_sorted.iterrows():
         key = (row['Symbol'], row['expiry'], row['strike'])
 
         if row['is_open']:
-            if key not in open_queue:
-                open_queue[key] = []
-            open_queue[key].append({
-                'date':  row['date'],
-                'qty':   row['qty'],
-                'net':   row['net'],
-                'order': row['Order'],
+            open_queue.setdefault(key, []).append({
+                'date':   row['date'],
+                'qty':    row['qty'],
+                'net':    row['net'],
+                'order':  row['Order'],
+                'expiry': row['expiry'],
+                'strike': row['strike'],
             })
 
         elif row['is_close']:
-            queue = open_queue.get(key, [])
+            oid = row['Order']
+            close_orders.setdefault(oid, []).append(row)
+            # Guarda metadados da ordem (só precisa uma vez)
+            if oid not in close_order_meta:
+                close_order_meta[oid] = {
+                    'symbol':   row['Symbol'],
+                    'date':     row['date'],
+                    'datetime': row['datetime'],
+                    'net':      row['net'],   # net total da ordem (já em $, só na 1ª leg)
+                }
 
-            # Net do fechamento — só conta uma vez por ordem (evita dupla contagem multi-leg)
-            order_id   = row['Order']
-            close_net  = row['net'] if order_id not in order_net_used else 0.0
-            order_net_used.add(order_id)
+    # ── Passo 2: processar cada ordem de fechamento como bloco único ──────────
+    trades = []
 
-            qty_to_close   = row['qty']
-            total_close_qty = row['qty']  # denominador para rateio proporcional
+    # Ordena as ordens de fechamento cronologicamente
+    sorted_close_orders = sorted(
+        close_orders.items(),
+        key=lambda x: close_order_meta[x[0]]['datetime']
+    )
+
+    for oid, legs in sorted_close_orders:
+        meta       = close_order_meta[oid]
+        close_net  = meta['net']      # crédito/débito líquido da ordem inteira (em $)
+        close_date = meta['date']
+        symbol     = meta['symbol']
+
+        # Descreve os strikes fechados nesta ordem (para exibição)
+        strikes_closed = sorted(set(r['strike'] for r in legs))
+        expiry         = legs[0]['expiry']
+
+        # Consome openers de cada leg e acumula open cost total
+        total_open_cost = 0.0
+        open_date_min   = None
+        consumed        = []   # lista de (strike, qty_matched, open_cost_parcial)
+
+        for leg in legs:
+            key          = (symbol, leg['expiry'], leg['strike'])
+            queue        = open_queue.get(key, [])
+            qty_to_close = leg['qty']
 
             while qty_to_close > 0 and queue:
                 opener  = queue[0]
                 matched = min(opener['qty'], qty_to_close)
 
-                # Proporção desta leg no fechamento total
-                frac = matched / total_close_qty if total_close_qty > 0 else 0
+                open_cost_parcial = opener['net'] * (matched / opener['qty']) if opener['qty'] > 0 else 0
+                total_open_cost  += open_cost_parcial
 
-                open_cost    = opener['net'] * (matched / opener['qty']) if opener['qty'] > 0 else 0
-                close_credit = close_net * frac
+                if open_date_min is None or opener['date'] < open_date_min:
+                    open_date_min = opener['date']
 
-                pnl = open_cost + close_credit
-                pct = round((pnl / abs(open_cost)) * 100, 1) if open_cost != 0 else 0
-
-                trades.append({
-                    'Symbol':       row['Symbol'],
-                    'Expiry':       row['expiry'],
-                    'Strike':       row['strike'],
-                    'Open Date':    str(opener['date']),
-                    'Close Date':   str(row['date']),
-                    'Open Cost':    round(open_cost, 2),
-                    'Close Credit': round(close_credit, 2),
-                    'PnL ($)':      round(pnl, 2),
-                    'PnL (%)':      pct,
-                    'Result':       'Win' if pnl > 0 else ('Loss' if pnl < 0 else 'BE'),
-                    'Status':       'Fechado',
+                consumed.append({
+                    'strike':    leg['strike'],
+                    'qty':       matched,
+                    'open_cost': open_cost_parcial,
                 })
 
                 opener['qty'] -= matched
@@ -241,14 +270,36 @@ def match_trades(expanded_df):
                 if opener['qty'] == 0:
                     queue.pop(0)
 
-    # Posições ainda abertas (não foram fechadas)
+        # PnL da operação inteira = open costs acumulados + net do fechamento
+        pnl = total_open_cost + close_net
+        pct = round((pnl / abs(total_open_cost)) * 100, 1) if total_open_cost != 0 else 0
+
+        # Strike descritivo: "205/220/265" se multi-leg, ou o único strike
+        strike_label = '/'.join(str(int(s)) if s == int(s) else str(s) for s in strikes_closed)
+
+        trades.append({
+            'Symbol':       symbol,
+            'Expiry':       expiry,
+            'Strike':       strike_label,
+            'Open Date':    str(open_date_min) if open_date_min else '—',
+            'Close Date':   str(close_date),
+            'Open Cost':    round(total_open_cost, 2),
+            'Close Credit': round(close_net, 2),
+            'PnL ($)':      round(pnl, 2),
+            'PnL (%)':      pct,
+            'Result':       'Win' if pnl > 0 else ('Loss' if pnl < 0 else 'BE'),
+            'Status':       'Fechado',
+        })
+
+    # ── Passo 3: posições ainda abertas ──────────────────────────────────────
     for key, queue in open_queue.items():
         for opener in queue:
             if opener['qty'] > 0:
+                strike_s = str(int(key[2])) if key[2] == int(key[2]) else str(key[2])
                 trades.append({
                     'Symbol':       key[0],
                     'Expiry':       key[1],
-                    'Strike':       key[2],
+                    'Strike':       strike_s,
                     'Open Date':    str(opener['date']),
                     'Close Date':   '—',
                     'Open Cost':    round(opener['net'], 2),

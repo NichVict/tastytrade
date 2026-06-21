@@ -141,18 +141,40 @@ def get_legs(desc):
 def expand_rows(df):
     """
     Expande cada linha do CSV em uma sub-row por leg.
-    O preço (net_pts) é o net da ordem inteira — atribuído à primeira leg,
-    zerado nas demais (evita dupla contagem em spreads).
+
+    Regra de alocação do net:
+    - Single-leg (BTO, STO, STC, BTC isolados): net vai inteiro para a leg.
+    - Multi-leg de ABERTURA (BTO+STO na mesma ordem, ex: spread):
+        net líquido vai só para a leg BTO; STO recebe 0 (já embutido no preço).
+    - Multi-leg de FECHAMENTO: net total vai só na primeira leg (i==0);
+        match_trades agrupa pelo Order # e usa o net total da ordem.
     """
     rows = []
     for _, row in df.iterrows():
         legs = get_legs(row['Description'])
         if not legs:
             continue
-        net_pts = parse_price(row['MarketOrFill'])  # cr=positivo, db=negativo
+        net_pts  = parse_price(row['MarketOrFill'])  # cr=positivo, db=negativo
+        net_dol  = net_pts * 100
+
+        is_open_order  = all(l['action'] in ('BTO', 'STO') for l in legs)
+        is_close_order = all(l['action'] in ('STC', 'BTC') for l in legs)
+        is_mixed_open  = is_open_order and len(legs) > 1  # spread aberto numa ordem
+
         for i, leg in enumerate(legs):
             is_open  = leg['action'] in ('BTO', 'STO')
             is_close = leg['action'] in ('STC', 'BTC')
+
+            if is_mixed_open:
+                # Spread aberto numa ordem: net líquido só na leg BTO
+                net = net_dol if leg['action'] == 'BTO' else 0.0
+            elif is_close_order:
+                # Fechamento: net total só na primeira leg
+                net = net_dol if i == 0 else 0.0
+            else:
+                # Single-leg de qualquer tipo
+                net = net_dol
+
             rows.append({
                 'Symbol':   row['Symbol'],
                 'Order':    row['Order #'],
@@ -162,8 +184,7 @@ def expand_rows(df):
                 'strike':   leg['strike'],
                 'action':   leg['action'],
                 'qty':      leg['qty'],
-                # net em dólares só na primeira leg do grupo
-                'net':      net_pts * 100 if i == 0 else 0.0,
+                'net':      net,
                 'is_open':  is_open,
                 'is_close': is_close,
             })

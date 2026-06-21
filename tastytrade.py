@@ -47,23 +47,28 @@ footer{visibility:hidden;} #MainMenu{visibility:hidden;} header{visibility:hidde
 
 # ── Parser do Statement / Confirmation PDF ────────────────────────────────────
 
-def _make_txn(bs, date_s, pc, sym, expiry_s, strike, qty, price):
-    mo, dy, yr = date_s.split('/')
-    date_fmt = f"20{yr}-{mo}-{dy}"
+def _make_txn(bs, opening, date_s, pc, sym, expiry_s, strike, qty, price):
+    mo, dy, yr   = date_s.split('/')
     mo2, dy2, yr2 = expiry_s.split('/')
-    expiry_fmt = f"20{yr2}-{mo2}-{dy2}"
     net = price * qty * 100 * (1 if bs == 'SOLD' else -1)
     return {
-        'date': date_fmt, 'bs': bs, 'sym': sym, 'put_call': pc,
-        'expiry': expiry_fmt, 'strike': strike, 'qty': qty,
-        'price': price, 'net': net,
+        'date'    : f"20{yr}-{mo}-{dy}",
+        'bs'      : bs,
+        'opening' : opening,
+        'sym'     : sym,
+        'put_call': pc,
+        'expiry'  : f"20{yr2}-{mo2}-{dy2}",
+        'strike'  : strike,
+        'qty'     : qty,
+        'price'   : price,
+        'net'     : net,
     }
 
 
 def parse_pdf(uploaded_file) -> list[dict]:
     """
     Extrai transações de statements mensais OU confirmations diários da Apex.
-    Detecta o formato automaticamente e retorna lista de dicts padronizados.
+    Usa OPEN CONTRACT / CLOSING CONTRACT para distinguir abertura de fechamento.
     """
     text = ""
     with pdfplumber.open(uploaded_file) as pdf:
@@ -73,26 +78,27 @@ def parse_pdf(uploaded_file) -> list[dict]:
                 text += t + "\n"
 
     transactions = []
+    lines = text.split('\n')
 
     # ── Formato 1: Statement mensal ──────────────────────────────────────────
-    # BOUGHT/SOLD  MM/DD/YY  M  CALL/PUT SYM  MM/DD/YY STRIKE  QTY  PRICE
     pat_stmt = re.compile(
-        r'(BOUGHT|SOLD)\s+'
-        r'(\d{2}/\d{2}/\d{2})\s+M\s+'
-        r'(CALL|PUT)\s+(\w+)\s+'
-        r'(\d{2}/\d{2}/\d{2})\s+'
+        r'(BOUGHT|SOLD)\s+(\d{2}/\d{2}/\d{2})\s+M\s+'
+        r'(CALL|PUT)\s+(\w+)\s+(\d{2}/\d{2}/\d{2})\s+'
         r'([\d.]+)\s+(\d+)\s+([\d.,]+)'
     )
-    for m in pat_stmt.finditer(text):
+    for i, line in enumerate(lines):
+        m = pat_stmt.search(line)
+        if not m:
+            continue
+        context = '\n'.join(lines[i:i+6])
+        is_open = 'OPEN CONTRACT' in context
         transactions.append(_make_txn(
-            m.group(1), m.group(2), m.group(3), m.group(4),
+            m.group(1), is_open, m.group(2), m.group(3), m.group(4),
             m.group(5), float(m.group(6)), int(m.group(7)),
             float(m.group(8).replace(',',''))
         ))
 
     # ── Formato 2: Confirmation diário ───────────────────────────────────────
-    # Linha 1: 2  B/S  MM/DD/YY  MM/DD/YY  QTY  PRICE  ...
-    # Linha 2: Desc: CALL/PUT SYM MM/DD/YY STRIKE ...
     if not transactions:
         pat_data = re.compile(
             r'^\s*2\s+(B|S)\s+(\d{2}/\d{2}/\d{2})\s+\d{2}/\d{2}/\d{2}\s+(\d+)\s+([\d.]+)',
@@ -101,18 +107,18 @@ def parse_pdf(uploaded_file) -> list[dict]:
         pat_desc = re.compile(
             r'Desc:\s+(CALL|PUT)\s+(\w+)\s+(\d{2}/\d{2}/\d{2})\s+([\d.]+)'
         )
-        lines = text.split('\n')
         for i, line in enumerate(lines):
             m_data = pat_data.match(line)
             if not m_data:
                 continue
-            desc_text = '\n'.join(lines[i+1:i+4])
-            m_desc = pat_desc.search(desc_text)
+            context = '\n'.join(lines[i:i+5])
+            m_desc  = pat_desc.search(context)
             if not m_desc:
                 continue
-            bs = 'BOUGHT' if m_data.group(1) == 'B' else 'SOLD'
+            is_open = 'OPEN CONTRACT' in context
+            bs      = 'BOUGHT' if m_data.group(1) == 'B' else 'SOLD'
             transactions.append(_make_txn(
-                bs, m_data.group(2), m_desc.group(1), m_desc.group(2),
+                bs, is_open, m_data.group(2), m_desc.group(1), m_desc.group(2),
                 m_desc.group(3), float(m_desc.group(4)),
                 int(m_data.group(3)), float(m_data.group(4))
             ))
@@ -124,45 +130,62 @@ def parse_pdf(uploaded_file) -> list[dict]:
 
 def build_trade_log(txns: list[dict]) -> pd.DataFrame:
     """
-    FIFO por (sym, expiry, strike):
-    - BOUGHT → empilha preço de entrada
-    - SOLD   → desempilha e calcula PnL = (sell - buy) * qty * 100
-    Retorna DataFrame com trades fechados e posições abertas.
-    """
-    # Ordena cronologicamente
-    txns_sorted = sorted(txns, key=lambda x: x['date'])
+    FIFO por (sym, expiry, strike, put_call).
+    Usa o campo 'opening' (OPEN CONTRACT vs CLOSING CONTRACT) para distinguir
+    abertura de fechamento — independente de ser BOUGHT ou SOLD.
 
-    # Pilha por chave: lista de {'price': float, 'date': str}
-    stacks = defaultdict(deque)
+    Lógica de PnL:
+    - OPEN  BOUGHT (BTO) → long aberto, preço de entrada positivo
+    - OPEN  SOLD   (STO) → short aberto, preço de entrada negativo (crédito recebido)
+    - CLOSE SOLD   (STC) → fecha long:  PnL = (close - open) * 100
+    - CLOSE BOUGHT (BTC) → fecha short: PnL = (open - close) * 100
+      (recebeu crédito na abertura, paga débito no fechamento)
+    """
+    txns_sorted = sorted(txns, key=lambda x: x['date'])
+    stacks = defaultdict(deque)  # key -> deque de {'price', 'date', 'bs'}
     trades = []
 
     for t in txns_sorted:
         key = (t['sym'], t['expiry'], t['strike'], t['put_call'])
 
-        if t['bs'] == 'BOUGHT':
-            # Empilha 1 entrada por contrato
+        if t['opening']:
+            # Abertura: empilha 1 slot por contrato
             for _ in range(t['qty']):
-                stacks[key].append({'price': t['price'], 'date': t['date']})
+                stacks[key].append({
+                    'price': t['price'],
+                    'date' : t['date'],
+                    'bs'   : t['bs'],   # BOUGHT=long, SOLD=short
+                })
 
-        else:  # SOLD
+        else:
+            # Fechamento: desempilha e calcula PnL
             qty_need = t['qty']
             while qty_need > 0 and stacks[key]:
-                opener   = stacks[key].popleft()
-                pnl      = (t['price'] - opener['price']) * 100
-                pct      = round((pnl / (opener['price'] * 100)) * 100, 1) if opener['price'] else 0
+                opener = stacks[key].popleft()
+
+                if opener['bs'] == 'BOUGHT':
+                    # Era long: vendeu para fechar (STC)
+                    pnl = (t['price'] - opener['price']) * 100
+                else:
+                    # Era short: comprou para fechar (BTC)
+                    pnl = (opener['price'] - t['price']) * 100
+
+                pct = round((pnl / (opener['price'] * 100)) * 100, 1) if opener['price'] else 0
+
                 trades.append({
-                    'Symbol'      : t['sym'],
-                    'Type'        : t['put_call'],
-                    'Strike'      : t['strike'],
-                    'Expiry'      : t['expiry'],
-                    'Open Date'   : opener['date'],
-                    'Close Date'  : t['date'],
-                    'Buy Price'   : opener['price'],
-                    'Sell Price'  : t['price'],
-                    'PnL ($)'     : round(pnl, 2),
-                    'PnL (%)'     : pct,
-                    'Result'      : 'Win' if pnl > 0 else ('Loss' if pnl < 0 else 'BE'),
-                    'Status'      : 'Fechado',
+                    'Symbol'     : t['sym'],
+                    'Type'       : t['put_call'],
+                    'Strike'     : t['strike'],
+                    'Expiry'     : t['expiry'],
+                    'Open Date'  : opener['date'],
+                    'Close Date' : t['date'],
+                    'Open Price' : opener['price'],
+                    'Close Price': t['price'],
+                    'Direction'  : 'Long' if opener['bs'] == 'BOUGHT' else 'Short',
+                    'PnL ($)'    : round(pnl, 2),
+                    'PnL (%)'    : pct,
+                    'Result'     : 'Win' if pnl > 0 else ('Loss' if pnl < 0 else 'BE'),
+                    'Status'     : 'Fechado',
                 })
                 qty_need -= 1
 
@@ -171,18 +194,19 @@ def build_trade_log(txns: list[dict]) -> pd.DataFrame:
         sym, expiry, strike, pc = key
         for opener in stack:
             trades.append({
-                'Symbol'    : sym,
-                'Type'      : pc,
-                'Strike'    : strike,
-                'Expiry'    : expiry,
-                'Open Date' : opener['date'],
-                'Close Date': '—',
-                'Buy Price' : opener['price'],
-                'Sell Price': None,
-                'PnL ($)'   : 0.0,
-                'PnL (%)'   : 0.0,
-                'Result'    : '—',
-                'Status'    : 'Aberto',
+                'Symbol'     : sym,
+                'Type'       : pc,
+                'Strike'     : strike,
+                'Expiry'     : expiry,
+                'Open Date'  : opener['date'],
+                'Close Date' : '—',
+                'Open Price' : opener['price'],
+                'Close Price': None,
+                'Direction'  : 'Long' if opener['bs'] == 'BOUGHT' else 'Short',
+                'PnL ($)'    : 0.0,
+                'PnL (%)'    : 0.0,
+                'Result'     : '—',
+                'Status'     : 'Aberto',
             })
 
     return pd.DataFrame(trades)
@@ -439,12 +463,13 @@ with tab1:
         <div class="trade-header">
             <div style="min-width:55px">Symbol</div>
             <div style="min-width:45px">Type</div>
+            <div style="min-width:65px">Dir</div>
             <div style="min-width:70px">Strike</div>
             <div style="min-width:90px">Expiry</div>
             <div style="min-width:95px">Open Date</div>
             <div style="min-width:95px">Close Date</div>
-            <div style="min-width:90px">Buy Price</div>
-            <div style="min-width:90px">Sell Price</div>
+            <div style="min-width:90px">Open $</div>
+            <div style="min-width:90px">Close $</div>
             <div style="min-width:95px">PnL ($)</div>
             <div style="min-width:70px">PnL (%)</div>
             <div style="min-width:55px">Result</div>
@@ -455,16 +480,18 @@ with tab1:
             pnl_c = 'win' if pnl > 0 else 'loss'
             sym_color = '#00d4aa' if css == 'win' else '#ff3d57' if css == 'loss' else '#e6edf3'
             pnl_s = f"${pnl:,.2f}"; pct_s = f"{pct:+.1f}%"
+            dir_color = '#4f8ef7' if row['Direction'] == 'Long' else '#ffd600'
             st.markdown(f"""
             <div class="trade-row {css}">
                 <div class="trade-cell sym" style="color:{sym_color}">{row['Symbol']}</div>
                 <div class="trade-cell muted">{row['Type']}</div>
+                <div class="trade-cell muted" style="color:{dir_color}">{row['Direction']}</div>
                 <div class="trade-cell muted">{row['Strike']:.1f}</div>
                 <div class="trade-cell muted">{row['Expiry']}</div>
                 <div class="trade-cell muted">{row['Open Date']}</div>
                 <div class="trade-cell muted">{row['Close Date']}</div>
-                <div class="trade-cell muted">${row['Buy Price']:.2f}</div>
-                <div class="trade-cell muted">${row['Sell Price']:.2f}</div>
+                <div class="trade-cell muted">${row['Open Price']:.2f}</div>
+                <div class="trade-cell muted">${row['Close Price']:.2f}</div>
                 <div class="trade-cell {pnl_c}">{pnl_s}</div>
                 <div class="trade-cell {pnl_c}">{pct_s}</div>
                 <div class="trade-cell {pnl_c}" style="font-weight:700">{res}</div>
@@ -476,11 +503,11 @@ with tab2:
     st.markdown('<div class="section-title">Posições Abertas</div>', unsafe_allow_html=True)
     if not opened.empty:
         for _, op in opened.iterrows():
-            cost = op['Buy Price'] * 100
+            cost = op['Open Price'] * 100
             st.markdown(f"""<div class="open-pos-card">
                 <span style="color:#ffd600;font-weight:600;">{op['Symbol']}</span>
                 &nbsp;|&nbsp; <span style="color:#8b949e;">{op['Type']} {op['Strike']:.1f} · exp {op['Expiry']}</span>
-                &nbsp;|&nbsp; Compra: <span style="color:#ff3d57;">${op['Buy Price']:.2f}</span>
+                &nbsp;|&nbsp; Compra: <span style="color:#ff3d57;">${op['Open Price']:.2f}</span>
                 &nbsp;|&nbsp; Custo: <span style="color:#ff3d57;">-${cost:.0f}</span>
                 &nbsp;|&nbsp; <span style="color:#8b949e;">desde {op['Open Date']}</span>
             </div>""", unsafe_allow_html=True)

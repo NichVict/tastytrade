@@ -47,10 +47,23 @@ footer{visibility:hidden;} #MainMenu{visibility:hidden;} header{visibility:hidde
 
 # ── Parser do Statement / Confirmation PDF ────────────────────────────────────
 
+def _make_txn(bs, date_s, pc, sym, expiry_s, strike, qty, price):
+    mo, dy, yr = date_s.split('/')
+    date_fmt = f"20{yr}-{mo}-{dy}"
+    mo2, dy2, yr2 = expiry_s.split('/')
+    expiry_fmt = f"20{yr2}-{mo2}-{dy2}"
+    net = price * qty * 100 * (1 if bs == 'SOLD' else -1)
+    return {
+        'date': date_fmt, 'bs': bs, 'sym': sym, 'put_call': pc,
+        'expiry': expiry_fmt, 'strike': strike, 'qty': qty,
+        'price': price, 'net': net,
+    }
+
+
 def parse_pdf(uploaded_file) -> list[dict]:
     """
-    Extrai transações de statements mensais ou confirmations diários da Apex.
-    Retorna lista de dicts: date, bs, sym, put_call, expiry, strike, qty, price, net
+    Extrai transações de statements mensais OU confirmations diários da Apex.
+    Detecta o formato automaticamente e retorna lista de dicts padronizados.
     """
     text = ""
     with pdfplumber.open(uploaded_file) as pdf:
@@ -61,47 +74,48 @@ def parse_pdf(uploaded_file) -> list[dict]:
 
     transactions = []
 
-    pattern = re.compile(
+    # ── Formato 1: Statement mensal ──────────────────────────────────────────
+    # BOUGHT/SOLD  MM/DD/YY  M  CALL/PUT SYM  MM/DD/YY STRIKE  QTY  PRICE
+    pat_stmt = re.compile(
         r'(BOUGHT|SOLD)\s+'
-        r'(\d{2}/\d{2}/\d{2})\s+'   # trade date MM/DD/YY
-        r'M\s+'                       # account type
-        r'(CALL|PUT)\s+'              # tipo
-        r'(\w+)\s+'                   # symbol
-        r'(\d{2}/\d{2}/\d{2})\s+'    # expiry MM/DD/YY
-        r'([\d.]+)\s+'               # strike
-        r'(\d+)\s+'                  # qty
-        r'([\d.,]+)'                 # price
+        r'(\d{2}/\d{2}/\d{2})\s+M\s+'
+        r'(CALL|PUT)\s+(\w+)\s+'
+        r'(\d{2}/\d{2}/\d{2})\s+'
+        r'([\d.]+)\s+(\d+)\s+([\d.,]+)'
     )
+    for m in pat_stmt.finditer(text):
+        transactions.append(_make_txn(
+            m.group(1), m.group(2), m.group(3), m.group(4),
+            m.group(5), float(m.group(6)), int(m.group(7)),
+            float(m.group(8).replace(',',''))
+        ))
 
-    for m in pattern.finditer(text):
-        bs     = m.group(1)
-        date_s = m.group(2)          # MM/DD/YY
-        pc     = m.group(3)
-        sym    = m.group(4)
-        expiry = m.group(5)          # MM/DD/YY
-        strike = float(m.group(6))
-        qty    = int(m.group(7))
-        price  = float(m.group(8).replace(',', ''))
-
-        # Converte datas para YYYY-MM-DD
-        mo, dy, yr = date_s.split('/')
-        date_fmt = f"20{yr}-{mo}-{dy}"
-        mo2, dy2, yr2 = expiry.split('/')
-        expiry_fmt = f"20{yr2}-{mo2}-{dy2}"
-
-        net = price * qty * 100 * (1 if bs == 'SOLD' else -1)
-
-        transactions.append({
-            'date'    : date_fmt,
-            'bs'      : bs,
-            'sym'     : sym,
-            'put_call': pc,
-            'expiry'  : expiry_fmt,
-            'strike'  : strike,
-            'qty'     : qty,
-            'price'   : price,
-            'net'     : net,
-        })
+    # ── Formato 2: Confirmation diário ───────────────────────────────────────
+    # Linha 1: 2  B/S  MM/DD/YY  MM/DD/YY  QTY  PRICE  ...
+    # Linha 2: Desc: CALL/PUT SYM MM/DD/YY STRIKE ...
+    if not transactions:
+        pat_data = re.compile(
+            r'^\s*2\s+(B|S)\s+(\d{2}/\d{2}/\d{2})\s+\d{2}/\d{2}/\d{2}\s+(\d+)\s+([\d.]+)',
+            re.MULTILINE
+        )
+        pat_desc = re.compile(
+            r'Desc:\s+(CALL|PUT)\s+(\w+)\s+(\d{2}/\d{2}/\d{2})\s+([\d.]+)'
+        )
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            m_data = pat_data.match(line)
+            if not m_data:
+                continue
+            desc_text = '\n'.join(lines[i+1:i+4])
+            m_desc = pat_desc.search(desc_text)
+            if not m_desc:
+                continue
+            bs = 'BOUGHT' if m_data.group(1) == 'B' else 'SOLD'
+            transactions.append(_make_txn(
+                bs, m_data.group(2), m_desc.group(1), m_desc.group(2),
+                m_desc.group(3), float(m_desc.group(4)),
+                int(m_data.group(3)), float(m_data.group(4))
+            ))
 
     return transactions
 
